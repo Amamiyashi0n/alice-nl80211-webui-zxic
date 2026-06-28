@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -15,6 +16,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -53,8 +55,15 @@
 #define SCAN_HTML_MAX 28000
 #define SAVED_HTML_MAX 12000
 #define AUTOSTART_HTML_MAX 6000
-#define PAGE_BODY_MAX 65536
+#define SYSTEM_HTML_MAX 42000
+#define SYSTEM_TEXT_MAX 32768
+#define PAGE_BODY_MAX 131072
 #define SAVED_WIFI_MAX 8
+#define SYS_IFACE_MAX 32
+#define SYS_ROUTE_MAX 24
+#define SYS_ARP_MAX 24
+#define SYS_LISTEN_MAX 24
+#define SYS_FS_MAX 8
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -140,6 +149,82 @@ struct autostart_status {
 	int run_ready;
 	int script_ready;
 	int hook_ready;
+};
+
+struct sys_iface {
+	char name[IFNAMSIZ];
+	char kind[24];
+	char mac[32];
+	char ipv4[64];
+	char ipv6[96];
+	char state[64];
+	char bridge[IFNAMSIZ];
+	unsigned int flags;
+	unsigned long mtu;
+	unsigned long long rx_bytes;
+	unsigned long long rx_packets;
+	unsigned long long rx_errs;
+	unsigned long long rx_drop;
+	unsigned long long tx_bytes;
+	unsigned long long tx_packets;
+	unsigned long long tx_errs;
+	unsigned long long tx_drop;
+	int is_sta;
+	int is_default;
+	int has_wireless;
+};
+
+struct sys_route {
+	char iface[IFNAMSIZ];
+	char dest[64];
+	char gateway[64];
+	char mask[64];
+	unsigned int flags;
+	unsigned int metric;
+	int is_default;
+};
+
+struct sys_arp {
+	char ip[64];
+	char mac[32];
+	char flags[16];
+	char iface[IFNAMSIZ];
+};
+
+struct sys_listen {
+	char proto[16];
+	char local[96];
+	char state[32];
+	char pidprog[96];
+};
+
+struct sys_fs {
+	char path[64];
+	char type[32];
+	char opts[128];
+	unsigned long total_kb;
+	unsigned long avail_kb;
+};
+
+struct system_snapshot {
+	char hostname[64];
+	char kernel[192];
+	char uptime[64];
+	char loadavg[96];
+	char mem[128];
+	char dns_user[192];
+	char dns_system[192];
+	char default_iface[IFNAMSIZ];
+	struct sys_iface ifaces[SYS_IFACE_MAX];
+	int iface_count;
+	struct sys_route routes[SYS_ROUTE_MAX];
+	int route_count;
+	struct sys_arp arps[SYS_ARP_MAX];
+	int arp_count;
+	struct sys_listen listens[SYS_LISTEN_MAX];
+	int listen_count;
+	struct sys_fs filesystems[SYS_FS_MAX];
+	int fs_count;
 };
 
 /*
@@ -2597,6 +2682,491 @@ static void read_dns_file(const char *path, char *out, size_t outsz)
 	fclose(fp);
 }
 
+static void strip_newline(char *s)
+{
+	size_t len;
+
+	if (!s)
+		return;
+	len = strlen(s);
+	while (len && (s[len - 1] == '\n' || s[len - 1] == '\r'))
+		s[--len] = '\0';
+}
+
+static char *trim_left(char *s)
+{
+	while (*s == ' ' || *s == '\t')
+		s++;
+	return s;
+}
+
+static const char *iface_kind(const char *name, int has_wireless)
+{
+	if (strcmp(name, "lo") == 0)
+		return "Loopback";
+	if (strncmp(name, "wan", 3) == 0)
+		return "WAN";
+	if (strncmp(name, "br", 2) == 0)
+		return "Bridge";
+	if (strncmp(name, "usb", 3) == 0 || strncmp(name, "usblan", 6) == 0)
+		return "USB LAN";
+	if (has_wireless || strncmp(name, "wlan", 4) == 0)
+		return "WiFi";
+	if (strncmp(name, "sit", 3) == 0 || strstr(name, "tnl"))
+		return "Tunnel";
+	return "Other";
+}
+
+static int read_text_first_line(const char *path, char *out, size_t outsz)
+{
+	FILE *fp;
+
+	if (outsz)
+		out[0] = '\0';
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+	if (!fgets(out, outsz, fp)) {
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+	strip_newline(out);
+	return 0;
+}
+
+static void format_uptime(char *out, size_t outsz)
+{
+	FILE *fp;
+	double up = 0.0;
+	unsigned long days;
+	unsigned long hours;
+	unsigned long mins;
+
+	if (outsz)
+		out[0] = '\0';
+	fp = fopen("/proc/uptime", "r");
+	if (!fp)
+		return;
+	if (fscanf(fp, "%lf", &up) != 1) {
+		fclose(fp);
+		return;
+	}
+	fclose(fp);
+	days = (unsigned long)(up / 86400.0);
+	hours = ((unsigned long)up % 86400UL) / 3600UL;
+	mins = ((unsigned long)up % 3600UL) / 60UL;
+	if (days)
+		snprintf(out, outsz, "%lud %luh %lum", days, hours, mins);
+	else
+		snprintf(out, outsz, "%luh %lum", hours, mins);
+}
+
+static void read_mem_summary(char *out, size_t outsz)
+{
+	FILE *fp;
+	char key[64];
+	unsigned long value;
+	char unit[32];
+	unsigned long total = 0;
+	unsigned long free_kb = 0;
+	unsigned long cached = 0;
+	unsigned long buffers = 0;
+
+	if (outsz)
+		out[0] = '\0';
+	fp = fopen("/proc/meminfo", "r");
+	if (!fp)
+		return;
+	while (fscanf(fp, "%63s %lu %31s", key, &value, unit) == 3) {
+		if (strcmp(key, "MemTotal:") == 0)
+			total = value;
+		else if (strcmp(key, "MemFree:") == 0)
+			free_kb = value;
+		else if (strcmp(key, "Cached:") == 0)
+			cached = value;
+		else if (strcmp(key, "Buffers:") == 0)
+			buffers = value;
+	}
+	fclose(fp);
+	if (total)
+		snprintf(out, outsz, "%luK total / %luK free / %luK cache",
+			 total, free_kb, cached + buffers);
+}
+
+static int find_iface(struct system_snapshot *snap, const char *name)
+{
+	int i;
+
+	for (i = 0; i < snap->iface_count; i++) {
+		if (strcmp(snap->ifaces[i].name, name) == 0)
+			return i;
+	}
+	return -1;
+}
+
+static struct sys_iface *ensure_iface(struct system_snapshot *snap,
+				      const char *name)
+{
+	int idx;
+
+	if (!name || !*name)
+		return NULL;
+	idx = find_iface(snap, name);
+	if (idx >= 0)
+		return &snap->ifaces[idx];
+	if (snap->iface_count >= SYS_IFACE_MAX)
+		return NULL;
+	idx = snap->iface_count++;
+	memset(&snap->ifaces[idx], 0, sizeof(snap->ifaces[idx]));
+	snprintf(snap->ifaces[idx].name, sizeof(snap->ifaces[idx].name),
+		 "%s", name);
+	return &snap->ifaces[idx];
+}
+
+static void read_iface_ioctl(struct sys_iface *it)
+{
+	int fd;
+	struct ifreq ifr;
+	struct sockaddr_in *sin;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, it->name, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFFLAGS, &ifr) == 0) {
+		it->flags = (unsigned int)ifr.ifr_flags;
+		if (ifr.ifr_flags & IFF_UP)
+			buf_append(it->state, sizeof(it->state), "UP");
+		else
+			buf_append(it->state, sizeof(it->state), "DOWN");
+		if (ifr.ifr_flags & IFF_RUNNING)
+			buf_append(it->state, sizeof(it->state), " RUNNING");
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, it->name, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
+		unsigned char *a = (unsigned char *)ifr.ifr_hwaddr.sa_data;
+		snprintf(it->mac, sizeof(it->mac),
+			 "%02x:%02x:%02x:%02x:%02x:%02x",
+			 a[0], a[1], a[2], a[3], a[4], a[5]);
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, it->name, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFMTU, &ifr) == 0)
+		it->mtu = (unsigned long)ifr.ifr_mtu;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, it->name, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFADDR, &ifr) == 0) {
+		sin = (struct sockaddr_in *)&ifr.ifr_addr;
+		inet_ntop(AF_INET, &sin->sin_addr, it->ipv4, sizeof(it->ipv4));
+	}
+	close(fd);
+	if (!it->state[0])
+		snprintf(it->state, sizeof(it->state), "-");
+}
+
+static void read_iface_sysfs(struct sys_iface *it)
+{
+	char path[PATH_MAX];
+	char tmp[96];
+	char lower_state[64];
+	size_t i;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", it->name);
+	if (access(path, F_OK) == 0)
+		it->has_wireless = 1;
+	snprintf(path, sizeof(path), "/sys/class/net/%s/brport/bridge", it->name);
+	{
+		ssize_t n = readlink(path, tmp, sizeof(tmp) - 1);
+		if (n > 0) {
+			char *end;
+			char *slash;
+			tmp[n] = '\0';
+			end = strrchr(tmp, '/');
+			if (end && strcmp(end + 1, "bridge") == 0) {
+				*end = '\0';
+				end = strrchr(tmp, '/');
+			}
+			slash = end;
+			snprintf(it->bridge, sizeof(it->bridge), "%s",
+				 slash ? slash + 1 : tmp);
+		}
+	}
+	snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", it->name);
+	if (read_text_first_line(path, tmp, sizeof(tmp)) == 0 && tmp[0] &&
+	    strcmp(tmp, "unknown") != 0) {
+		snprintf(lower_state, sizeof(lower_state), "%s", it->state);
+		for (i = 0; lower_state[i]; i++)
+			lower_state[i] = (char)tolower((unsigned char)lower_state[i]);
+		if (strstr(lower_state, tmp))
+			return;
+		if (it->state[0])
+			buf_append(it->state, sizeof(it->state), " ");
+		buf_append(it->state, sizeof(it->state), "%s", tmp);
+	}
+}
+
+static void read_ipv6_addrs(struct system_snapshot *snap)
+{
+	FILE *fp;
+	char addr[40], iface[IFNAMSIZ];
+	unsigned int idx, plen, scope, flags;
+
+	fp = fopen("/proc/net/if_inet6", "r");
+	if (!fp)
+		return;
+	while (fscanf(fp, "%32s %x %x %x %x %15s",
+		      addr, &idx, &plen, &scope, &flags, iface) == 6) {
+		struct sys_iface *it = ensure_iface(snap, iface);
+		char pretty[96];
+		if (!it || it->ipv6[0])
+			continue;
+		snprintf(pretty, sizeof(pretty),
+			 "%.4s:%.4s:%.4s:%.4s:%.4s:%.4s:%.4s:%.4s/%u",
+			 addr, addr + 4, addr + 8, addr + 12, addr + 16,
+			 addr + 20, addr + 24, addr + 28, plen);
+		snprintf(it->ipv6, sizeof(it->ipv6), "%s", pretty);
+	}
+	fclose(fp);
+}
+
+static void read_proc_net_dev(struct system_snapshot *snap)
+{
+	FILE *fp;
+	char line[512];
+
+	fp = fopen("/proc/net/dev", "r");
+	if (!fp)
+		return;
+	if (!fgets(line, sizeof(line), fp) || !fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		char *colon = strchr(line, ':');
+		char *name;
+		struct sys_iface *it;
+		unsigned long long rx_fifo, rx_frame, rx_comp, rx_multi;
+		unsigned long long tx_fifo, tx_colls, tx_carrier, tx_comp;
+
+		if (!colon)
+			continue;
+		*colon = '\0';
+		name = trim_left(line);
+		strip_newline(name);
+		it = ensure_iface(snap, name);
+		if (!it)
+			continue;
+		sscanf(colon + 1,
+		       "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+		       &it->rx_bytes, &it->rx_packets, &it->rx_errs,
+		       &it->rx_drop, &rx_fifo, &rx_frame, &rx_comp, &rx_multi,
+		       &it->tx_bytes, &it->tx_packets, &it->tx_errs,
+		       &it->tx_drop, &tx_fifo, &tx_colls, &tx_carrier, &tx_comp);
+	}
+	fclose(fp);
+}
+
+static void read_bridge_members(struct system_snapshot *snap)
+{
+	DIR *dir;
+	struct dirent *de;
+
+	dir = opendir("/sys/class/net/br0/brif");
+	if (!dir)
+		return;
+	while ((de = readdir(dir)) != NULL) {
+		struct sys_iface *it;
+		if (de->d_name[0] == '.')
+			continue;
+		it = ensure_iface(snap, de->d_name);
+		if (it)
+			snprintf(it->bridge, sizeof(it->bridge), "br0");
+	}
+	closedir(dir);
+}
+
+static void read_routes(struct system_snapshot *snap)
+{
+	FILE *fp;
+	char line[256];
+
+	fp = fopen("/proc/net/route", "r");
+	if (!fp)
+		return;
+	fgets(line, sizeof(line), fp);
+	while (fgets(line, sizeof(line), fp)) {
+		char ifn[IFNAMSIZ];
+		unsigned long dest, gw, mask;
+		unsigned int flags, refcnt, use, metric, mtu, win, irtt;
+		struct in_addr a;
+		struct sys_route *rt;
+
+		if (snap->route_count >= SYS_ROUTE_MAX)
+			break;
+		if (sscanf(line, "%15s %lx %lx %x %u %u %u %lx %u %u %u",
+			   ifn, &dest, &gw, &flags, &refcnt, &use, &metric,
+			   &mask, &mtu, &win, &irtt) != 11)
+			continue;
+		rt = &snap->routes[snap->route_count++];
+		memset(rt, 0, sizeof(*rt));
+		snprintf(rt->iface, sizeof(rt->iface), "%s", ifn);
+		a.s_addr = (in_addr_t)dest;
+		inet_ntop(AF_INET, &a, rt->dest, sizeof(rt->dest));
+		a.s_addr = (in_addr_t)gw;
+		inet_ntop(AF_INET, &a, rt->gateway, sizeof(rt->gateway));
+		a.s_addr = (in_addr_t)mask;
+		inet_ntop(AF_INET, &a, rt->mask, sizeof(rt->mask));
+		rt->flags = flags;
+		rt->metric = metric;
+		rt->is_default = dest == 0;
+		if (rt->is_default && !snap->default_iface[0])
+			snprintf(snap->default_iface, sizeof(snap->default_iface),
+				 "%s", ifn);
+	}
+	fclose(fp);
+}
+
+static void read_arps(struct system_snapshot *snap)
+{
+	FILE *fp;
+	char line[256];
+
+	fp = fopen("/proc/net/arp", "r");
+	if (!fp)
+		return;
+	fgets(line, sizeof(line), fp);
+	while (fgets(line, sizeof(line), fp)) {
+		struct sys_arp *arp;
+		char hwtype[16], mask[32];
+		if (snap->arp_count >= SYS_ARP_MAX)
+			break;
+		arp = &snap->arps[snap->arp_count];
+		if (sscanf(line, "%63s %15s %15s %31s %31s %15s",
+			   arp->ip, hwtype, arp->flags, arp->mac, mask,
+			   arp->iface) == 6)
+			snap->arp_count++;
+	}
+	fclose(fp);
+}
+
+static void read_listeners(struct system_snapshot *snap)
+{
+	FILE *fp;
+	char line[256];
+
+	fp = popen("netstat -lntup 2>/dev/null", "r");
+	if (!fp)
+		return;
+	while (fgets(line, sizeof(line), fp)) {
+		struct sys_listen *ln;
+		char recvq[32], sendq[32], foreign[96];
+		char proto[16], local[96], state[32], pidprog[96];
+		int fields;
+
+		if (snap->listen_count >= SYS_LISTEN_MAX)
+			break;
+		if (strncmp(line, "tcp", 3) != 0 && strncmp(line, "udp", 3) != 0)
+			continue;
+		state[0] = '\0';
+		pidprog[0] = '\0';
+		fields = sscanf(line, "%15s %31s %31s %95s %95s %31s %95s",
+				proto, recvq, sendq, local, foreign, state,
+				pidprog);
+		if (fields < 6)
+			continue;
+		ln = &snap->listens[snap->listen_count++];
+		memset(ln, 0, sizeof(*ln));
+		snprintf(ln->proto, sizeof(ln->proto), "%s", proto);
+		snprintf(ln->local, sizeof(ln->local), "%s", local);
+		if (strncmp(proto, "udp", 3) == 0 && fields == 6) {
+			snprintf(ln->state, sizeof(ln->state), "-");
+			snprintf(ln->pidprog, sizeof(ln->pidprog), "%s", state);
+		} else {
+			snprintf(ln->state, sizeof(ln->state), "%s", state);
+			snprintf(ln->pidprog, sizeof(ln->pidprog), "%s",
+				 fields >= 7 ? pidprog : "-");
+		}
+	}
+	pclose(fp);
+}
+
+static void add_fs_usage(struct system_snapshot *snap, const char *path)
+{
+	FILE *fp;
+	char line[512];
+	struct statvfs sv;
+	struct sys_fs *fs;
+
+	if (snap->fs_count >= SYS_FS_MAX)
+		return;
+	fs = &snap->filesystems[snap->fs_count];
+	memset(fs, 0, sizeof(*fs));
+	snprintf(fs->path, sizeof(fs->path), "%s", path);
+	fp = fopen("/proc/mounts", "r");
+	if (fp) {
+		while (fgets(line, sizeof(line), fp)) {
+			char dev[128], mnt[128], type[32], opts[128];
+			if (sscanf(line, "%127s %127s %31s %127s",
+				   dev, mnt, type, opts) != 4)
+				continue;
+			if (strcmp(mnt, path) == 0) {
+				snprintf(fs->type, sizeof(fs->type), "%s", type);
+				snprintf(fs->opts, sizeof(fs->opts), "%s", opts);
+				break;
+			}
+		}
+		fclose(fp);
+	}
+	if (statvfs(path, &sv) == 0 && sv.f_frsize) {
+		fs->total_kb = (unsigned long)((sv.f_blocks * sv.f_frsize) / 1024);
+		fs->avail_kb = (unsigned long)((sv.f_bavail * sv.f_frsize) / 1024);
+	}
+	snap->fs_count++;
+}
+
+static void collect_system_snapshot(const struct app_config *cfg,
+				    struct system_snapshot *snap)
+{
+	int i;
+
+	memset(snap, 0, sizeof(*snap));
+	read_text_first_line("/proc/sys/kernel/hostname", snap->hostname,
+			     sizeof(snap->hostname));
+	read_text_first_line("/proc/version", snap->kernel, sizeof(snap->kernel));
+	read_text_first_line("/proc/loadavg", snap->loadavg, sizeof(snap->loadavg));
+	format_uptime(snap->uptime, sizeof(snap->uptime));
+	read_mem_summary(snap->mem, sizeof(snap->mem));
+	read_dns_file(cfg->dns_path, snap->dns_user, sizeof(snap->dns_user));
+	read_dns_file("/etc/resolv.conf", snap->dns_system,
+		      sizeof(snap->dns_system));
+
+	read_proc_net_dev(snap);
+	read_ipv6_addrs(snap);
+	read_bridge_members(snap);
+	read_routes(snap);
+	read_arps(snap);
+	read_listeners(snap);
+	add_fs_usage(snap, "/");
+	add_fs_usage(snap, "/tmp");
+	add_fs_usage(snap, "/mnt/userdata");
+	add_fs_usage(snap, "/mnt/imagefs");
+	add_fs_usage(snap, "/mnt/nvrofs");
+
+	for (i = 0; i < snap->iface_count; i++) {
+		struct sys_iface *it = &snap->ifaces[i];
+		read_iface_ioctl(it);
+		read_iface_sysfs(it);
+		snprintf(it->kind, sizeof(it->kind), "%s",
+			 iface_kind(it->name, it->has_wireless));
+		it->is_sta = strcmp(it->name, cfg->iface) == 0;
+		it->is_default = snap->default_iface[0] &&
+				 strcmp(it->name, snap->default_iface) == 0;
+	}
+}
+
 static void get_runtime_status(const struct app_config *cfg,
 			       struct runtime_status *st)
 {
@@ -2950,6 +3520,226 @@ static void build_autostart_html(char *out, size_t outsz)
 		   st.hook_ready ? "已安装" : "未安装");
 }
 
+static void build_system_html(const struct app_config *cfg, char *out,
+			      size_t outsz)
+{
+	struct system_snapshot snap;
+	char esc[512], esc2[512], esc3[512], esc4[512], esc5[512];
+	int i;
+
+	if (outsz)
+		out[0] = '\0';
+	collect_system_snapshot(cfg, &snap);
+
+	html_escape(esc, sizeof(esc), snap.hostname[0] ? snap.hostname : "-");
+	html_escape(esc2, sizeof(esc2), snap.uptime[0] ? snap.uptime : "-");
+	html_escape(esc3, sizeof(esc3), snap.loadavg[0] ? snap.loadavg : "-");
+	html_escape(esc4, sizeof(esc4), snap.default_iface[0] ?
+		    snap.default_iface : "-");
+	html_escape(esc5, sizeof(esc5), snap.mem[0] ? snap.mem : "-");
+	buf_append(out, outsz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">系统状态</div>"
+		   "<div class=\"hint\">只读信息，来自 /proc、ifconfig、route、netstat</div>"
+		   "</div><form method=\"get\" action=\"/\"><button class=\"alt\" type=\"submit\">刷新状态</button></form>"
+		   "</div><div class=\"pad\"><div class=\"grid\">"
+		   "<div class=\"kv\"><div class=\"k\">主机名</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">运行时间</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">负载</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">默认路由接口</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">内存</div><div class=\"v\">%s</div></div>",
+		   esc, esc2, esc3, esc4, esc5);
+	html_escape(esc, sizeof(esc), snap.dns_user[0] ? snap.dns_user : "-");
+	html_escape(esc2, sizeof(esc2), snap.dns_system[0] ?
+		    snap.dns_system : "-");
+	buf_append(out, outsz,
+		   "<div class=\"kv\"><div class=\"k\">wpa_mini DNS</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">系统 DNS</div><div class=\"v\">%s</div></div>",
+		   esc, esc2);
+	html_escape(esc, sizeof(esc), snap.kernel[0] ? snap.kernel : "-");
+	buf_append(out, outsz,
+		   "<div class=\"kv\"><div class=\"k\">内核</div><div class=\"v smallv\">%s</div></div>"
+		   "</div></div></section>",
+		   esc);
+
+	buf_append(out, outsz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">网络接口</div>"
+		   "<div class=\"hint\">列出目标系统发现的全部接口，WAN 口会自动标记</div>"
+		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
+		   "<th>接口</th><th>类型</th><th>状态</th><th>IPv4</th><th>MAC</th><th>Bridge</th><th>RX/TX</th><th>错误/丢包</th>"
+		   "</tr></thead><tbody>");
+	for (i = 0; i < snap.iface_count; i++) {
+		struct sys_iface *it = &snap.ifaces[i];
+		char rowcls[64] = "";
+		char rx_tx[128];
+		char errs[128];
+
+		if (it->is_sta)
+			snprintf(rowcls, sizeof(rowcls), " class=\"focusrow\"");
+		else if (it->is_default)
+			snprintf(rowcls, sizeof(rowcls), " class=\"defrow\"");
+		snprintf(rx_tx, sizeof(rx_tx), "%llu/%llu B",
+			 it->rx_bytes, it->tx_bytes);
+		snprintf(errs, sizeof(errs), "rx %llu/%llu · tx %llu/%llu",
+			 it->rx_errs, it->rx_drop, it->tx_errs, it->tx_drop);
+		html_escape(esc, sizeof(esc), it->name);
+		html_escape(esc2, sizeof(esc2), it->kind[0] ? it->kind : "-");
+		html_escape(esc3, sizeof(esc3), it->state[0] ? it->state : "-");
+		html_escape(esc4, sizeof(esc4), it->ipv4[0] ? it->ipv4 : "-");
+		html_escape(esc5, sizeof(esc5), it->mac[0] ? it->mac : "-");
+		buf_append(out, outsz,
+			   "<tr%s><td class=\"ssidcell\">%s%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>",
+			   rowcls, esc, it->is_sta ? " <span class=\"tag\">STA</span>" : "",
+			   it->is_default ? " <span class=\"tag\">默认</span>" : "",
+			   esc2, esc3, esc4, esc5);
+		html_escape(esc, sizeof(esc), it->bridge[0] ? it->bridge : "-");
+		html_escape(esc2, sizeof(esc2), rx_tx);
+		html_escape(esc3, sizeof(esc3), errs);
+		buf_append(out, outsz, "<td>%s</td><td>%s</td><td>%s</td></tr>",
+			   esc, esc2, esc3);
+	}
+	if (!snap.iface_count)
+		buf_append(out, outsz, "<tr><td colspan=\"8\">未读取到接口</td></tr>");
+	buf_append(out, outsz, "</tbody></table></div></section>");
+
+	buf_append(out, outsz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">路由与邻居</div>"
+		   "<div class=\"hint\">IPv4 路由和 ARP 表</div>"
+		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
+		   "<th>目标</th><th>网关</th><th>掩码</th><th>接口</th><th>标记</th>"
+		   "</tr></thead><tbody>");
+	for (i = 0; i < snap.route_count; i++) {
+		struct sys_route *rt = &snap.routes[i];
+		html_escape(esc, sizeof(esc), rt->dest);
+		html_escape(esc2, sizeof(esc2), rt->gateway);
+		html_escape(esc3, sizeof(esc3), rt->mask);
+		html_escape(esc4, sizeof(esc4), rt->iface);
+		buf_append(out, outsz,
+			   "<tr%s><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>0x%x%s</td></tr>",
+			   rt->is_default ? " class=\"defrow\"" : "",
+			   esc, esc2, esc3, esc4, rt->flags,
+			   rt->is_default ? " 默认" : "");
+	}
+	if (!snap.route_count)
+		buf_append(out, outsz, "<tr><td colspan=\"5\">无 IPv4 路由</td></tr>");
+	buf_append(out, outsz, "</tbody></table></div><div class=\"tablewrap\"><table><thead><tr>"
+		   "<th>IP</th><th>MAC</th><th>接口</th><th>标记</th>"
+		   "</tr></thead><tbody>");
+	for (i = 0; i < snap.arp_count; i++) {
+		struct sys_arp *arp = &snap.arps[i];
+		html_escape(esc, sizeof(esc), arp->ip);
+		html_escape(esc2, sizeof(esc2), arp->mac);
+		html_escape(esc3, sizeof(esc3), arp->iface);
+		html_escape(esc4, sizeof(esc4), arp->flags);
+		buf_append(out, outsz,
+			   "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+			   esc, esc2, esc3, esc4);
+	}
+	if (!snap.arp_count)
+		buf_append(out, outsz, "<tr><td colspan=\"4\">无 ARP 记录</td></tr>");
+	buf_append(out, outsz, "</tbody></table></div></section>");
+
+	buf_append(out, outsz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">监听服务与挂载</div>"
+		   "<div class=\"hint\">当前开放端口和关键分区</div>"
+		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
+		   "<th>协议</th><th>监听地址</th><th>状态</th><th>进程</th>"
+		   "</tr></thead><tbody>");
+	for (i = 0; i < snap.listen_count; i++) {
+		struct sys_listen *ln = &snap.listens[i];
+		html_escape(esc, sizeof(esc), ln->proto);
+		html_escape(esc2, sizeof(esc2), ln->local);
+		html_escape(esc3, sizeof(esc3), ln->state);
+		html_escape(esc4, sizeof(esc4), ln->pidprog);
+		buf_append(out, outsz,
+			   "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+			   esc, esc2, esc3, esc4);
+	}
+	if (!snap.listen_count)
+		buf_append(out, outsz, "<tr><td colspan=\"4\">未读取到监听端口</td></tr>");
+	buf_append(out, outsz, "</tbody></table></div><div class=\"tablewrap\"><table><thead><tr>"
+		   "<th>挂载点</th><th>类型</th><th>可用/总量</th><th>选项</th>"
+		   "</tr></thead><tbody>");
+	for (i = 0; i < snap.fs_count; i++) {
+		struct sys_fs *fs = &snap.filesystems[i];
+		char usage[96];
+		snprintf(usage, sizeof(usage), "%luK / %luK",
+			 fs->avail_kb, fs->total_kb);
+		html_escape(esc, sizeof(esc), fs->path);
+		html_escape(esc2, sizeof(esc2), fs->type[0] ? fs->type : "-");
+		html_escape(esc3, sizeof(esc3), usage);
+		html_escape(esc4, sizeof(esc4), fs->opts[0] ? fs->opts : "-");
+		buf_append(out, outsz,
+			   "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+			   esc, esc2, esc3, esc4);
+	}
+	buf_append(out, outsz, "</tbody></table></div></section>");
+}
+
+static void build_system_text(const struct app_config *cfg, char *out,
+			      size_t outsz)
+{
+	struct system_snapshot snap;
+	int i;
+
+	if (outsz)
+		out[0] = '\0';
+	collect_system_snapshot(cfg, &snap);
+	buf_append(out, outsz, "hostname=%s\n", snap.hostname);
+	buf_append(out, outsz, "kernel=%s\n", snap.kernel);
+	buf_append(out, outsz, "uptime=%s\n", snap.uptime);
+	buf_append(out, outsz, "loadavg=%s\n", snap.loadavg);
+	buf_append(out, outsz, "memory=%s\n", snap.mem);
+	buf_append(out, outsz, "default_iface=%s\n", snap.default_iface);
+	buf_append(out, outsz, "dns_user=%s\n", snap.dns_user);
+	buf_append(out, outsz, "dns_system=%s\n\n", snap.dns_system);
+
+	buf_append(out, outsz, "[interfaces]\n");
+	for (i = 0; i < snap.iface_count; i++) {
+		struct sys_iface *it = &snap.ifaces[i];
+		buf_append(out, outsz,
+			   "%s kind=%s state=%s ipv4=%s ipv6=%s mac=%s mtu=%lu bridge=%s rx=%llu/%llu tx=%llu/%llu errdrop=%llu/%llu/%llu/%llu%s%s\n",
+			   it->name, it->kind, it->state, it->ipv4, it->ipv6,
+			   it->mac, it->mtu, it->bridge,
+			   it->rx_bytes, it->rx_packets,
+			   it->tx_bytes, it->tx_packets,
+			   it->rx_errs, it->rx_drop, it->tx_errs, it->tx_drop,
+			   it->is_sta ? " sta" : "",
+			   it->is_default ? " default" : "");
+	}
+	buf_append(out, outsz, "\n[routes]\n");
+	for (i = 0; i < snap.route_count; i++) {
+		struct sys_route *rt = &snap.routes[i];
+		buf_append(out, outsz,
+			   "%s dest=%s gateway=%s mask=%s flags=0x%x metric=%u%s\n",
+			   rt->iface, rt->dest, rt->gateway, rt->mask,
+			   rt->flags, rt->metric,
+			   rt->is_default ? " default" : "");
+	}
+	buf_append(out, outsz, "\n[arp]\n");
+	for (i = 0; i < snap.arp_count; i++) {
+		struct sys_arp *arp = &snap.arps[i];
+		buf_append(out, outsz, "%s mac=%s iface=%s flags=%s\n",
+			   arp->ip, arp->mac, arp->iface, arp->flags);
+	}
+	buf_append(out, outsz, "\n[listeners]\n");
+	for (i = 0; i < snap.listen_count; i++) {
+		struct sys_listen *ln = &snap.listens[i];
+		buf_append(out, outsz, "%s %s %s %s\n",
+			   ln->proto, ln->local, ln->state, ln->pidprog);
+	}
+	buf_append(out, outsz, "\n[filesystems]\n");
+	for (i = 0; i < snap.fs_count; i++) {
+		struct sys_fs *fs = &snap.filesystems[i];
+		buf_append(out, outsz, "%s type=%s avail=%luK total=%luK opts=%s\n",
+			   fs->path, fs->type, fs->avail_kb, fs->total_kb,
+			   fs->opts);
+	}
+}
+
 static void render_page(int fd, const struct app_config *cfg,
 			const char *message, const char *scan_text)
 {
@@ -2966,6 +3756,7 @@ static void render_page(int fd, const struct app_config *cfg,
 	char *scan_html;
 	char *saved_html;
 	char *autostart_html;
+	char *system_html;
 	char *body;
 	const char *state_color;
 	const char *state_label;
@@ -2975,11 +3766,14 @@ static void render_page(int fd, const struct app_config *cfg,
 	scan_html = calloc(1, SCAN_HTML_MAX);
 	saved_html = calloc(1, SAVED_HTML_MAX);
 	autostart_html = calloc(1, AUTOSTART_HTML_MAX);
+	system_html = calloc(1, SYSTEM_HTML_MAX);
 	body = calloc(1, PAGE_BODY_MAX);
-	if (!scan_html || !saved_html || !autostart_html || !body) {
+	if (!scan_html || !saved_html || !autostart_html || !system_html ||
+	    !body) {
 		free(scan_html);
 		free(saved_html);
 		free(autostart_html);
+		free(system_html);
 		free(body);
 		log_msg(cfg, "render page allocation failed");
 		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
@@ -3000,6 +3794,7 @@ static void render_page(int fd, const struct app_config *cfg,
 	build_scan_html(scan_text, scan_html, SCAN_HTML_MAX);
 	build_saved_html(saved_html, SAVED_HTML_MAX);
 	build_autostart_html(autostart_html, AUTOSTART_HTML_MAX);
+	build_system_html(cfg, system_html, SYSTEM_HTML_MAX);
 
 	state_color = strcmp(st.wpa_state, "COMPLETED") == 0 ? "#257a4b" :
 		      st.engine_running ? "#9b6b13" : "#a34444";
@@ -3019,13 +3814,13 @@ static void render_page(int fd, const struct app_config *cfg,
 		 ".pill{border-radius:999px;padding:7px 11px;background:%s;color:#fff;font-size:13px;font-weight:700;white-space:nowrap}"
 		 ".summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:1.35fr .9fr;gap:14px}.panel{background:#fff;border:1px solid #d9e2dc;border-radius:8px;margin-bottom:14px;box-shadow:0 4px 14px rgba(24,37,29,.05);overflow:hidden;animation:rise .22s ease-out}.panel.hot{animation:pulse .7s ease-out}"
 		 ".formtop{border-bottom:1px solid #e7ece8;padding:14px 16px}.title{font-size:16px;font-weight:700}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}"
-		 ".kv{border-bottom:1px solid #edf1ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e2dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:700;word-break:break-all;margin-top:3px}"
+		 ".kv{border-bottom:1px solid #edf1ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e2dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:700;word-break:break-all;margin-top:3px}.smallv{font-size:12px;font-weight:600;line-height:1.4}"
 		 ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:700;margin:11px 0 5px}"
 		 "input{width:100%%;height:40px;border:1px solid #b8c5bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none;transition:border-color .15s,box-shadow .15s}"
 		 "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:600}"
 		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}"
 		 "button.alt,button.scan{background:#fff;color:#2f7d4f}.msg{background:#f0f7f2;border:1px solid #cfe1d4;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px}.tablewrap{overflow:auto}"
-		 ".saved{border:1px solid #edf1ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:700;color:#1d3b29}"
+		 ".saved{border:1px solid #edf1ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:700;color:#1d3b29}.tag{display:inline-block;margin-left:5px;border-radius:5px;background:#e4f1e8;color:#286542;padding:2px 5px;font-size:11px}.focusrow{background:#f0f8f2}.defrow{background:#f8fbf3}"
 		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e7ece8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:700}"
 		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}}"
 		 "</style></head><body><div class=\"bar\"><div class=\"head\"><div><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
@@ -3054,7 +3849,7 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
-		 "</div></div></section></div>%s%s%s</main>"
+		 "</div></div></section></div>%s%s%s%s</main>"
 		 "<script>"
 		 "function pickNet(b){var s=document.getElementById('ssidInput'),m=document.getElementById('bssidInput'),p=document.getElementById('pskInput'),c=document.getElementById('connectPanel');if(s)s.value=b.getAttribute('data-ssid')||'';if(m)m.value=b.getAttribute('data-bssid')||'';if(c){c.classList.remove('hot');void c.offsetWidth;c.classList.add('hot');c.scrollIntoView({behavior:'smooth',block:'start'});}if(p)p.focus();}"
 		 "document.addEventListener('submit',function(e){var b=e.target.querySelector('button[type=submit]');if(b){b.classList.add('busy');b.textContent=b.textContent+'...';}});"
@@ -3075,6 +3870,7 @@ static void render_page(int fd, const struct app_config *cfg,
 		 esc_dns[0] ? esc_dns : "-",
 		 st.engine_running ? (long)st.engine_pid : 0L,
 		 st.dhcp_running ? (long)st.dhcp_pid : 0L,
+		 system_html,
 		 autostart_html,
 		 saved_html,
 		 scan_html);
@@ -3083,6 +3879,7 @@ static void render_page(int fd, const struct app_config *cfg,
 	free(scan_html);
 	free(saved_html);
 	free(autostart_html);
+	free(system_html);
 	free(body);
 }
 
@@ -3119,6 +3916,22 @@ static void render_status(int fd, const struct app_config *cfg)
 		 esc_iface, esc_state, esc_ssid, esc_bssid, esc_key,
 		 esc_ip, esc_gw, esc_dns, esc_dns_path, cfg->port);
 	http_send(fd, cfg, 200, "OK", "application/json", body);
+}
+
+static void render_system(int fd, const struct app_config *cfg)
+{
+	char *body;
+
+	log_msg(cfg, "render system");
+	body = calloc(1, SYSTEM_TEXT_MAX);
+	if (!body) {
+		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
+			  "out of memory\n");
+		return;
+	}
+	build_system_text(cfg, body, SYSTEM_TEXT_MAX);
+	http_send(fd, cfg, 200, "OK", "text/plain; charset=utf-8", body);
+	free(body);
 }
 
 static int content_length(const char *headers)
@@ -3467,6 +4280,8 @@ static void handle_client(int fd, const struct app_config *cfg)
 		render_page(fd, cfg, NULL, NULL);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/status") == 0) {
 		render_status(fd, cfg);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/system") == 0) {
+		render_system(fd, cfg);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/scan") == 0) {
 		handle_scan_text(fd, cfg);
 	} else if (strcmp(method, "POST") == 0 &&
