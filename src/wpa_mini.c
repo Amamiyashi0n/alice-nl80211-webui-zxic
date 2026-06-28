@@ -2316,9 +2316,9 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 	snprintf(copy, SCAN_TEXT_MAX, "%s", scan_text);
 	buf_append(out, outsz,
 		   "<section class=\"panel\"><div class=\"formtop\"><div>"
-		   "<div class=\"title\">扫描结果</div>"
-		   "<div class=\"hint\">由内置 STA 引擎返回的附近热点</div>"
-		   "</div></div><div class=\"pad\"><table><thead><tr>"
+		   "<div class=\"title\">附近 WiFi</div>"
+		   "<div class=\"hint\">扫描结果来自当前 STA 接口</div>"
+		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
 		   "<th>SSID</th><th>信号</th><th>安全</th><th>BSSID</th>"
 		   "</tr></thead><tbody>");
 
@@ -2400,8 +2400,8 @@ static void render_page(int fd, const struct app_config *cfg,
 	html_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
 	build_scan_html(scan_text, scan_html, SCAN_HTML_MAX);
 
-	state_color = strcmp(st.wpa_state, "COMPLETED") == 0 ? "#2f8f46" :
-		      st.engine_running ? "#9a6a00" : "#9b2f2f";
+	state_color = strcmp(st.wpa_state, "COMPLETED") == 0 ? "#257a4b" :
+		      st.engine_running ? "#9b6b13" : "#a34444";
 	state_label = strcmp(st.wpa_state, "COMPLETED") == 0 ? "已连接" :
 		      st.engine_running ? "连接中" : "已停止";
 
@@ -2410,26 +2410,23 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 		 "<title>WPA Mini</title>"
 		 "<style>"
-		 "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f1f8ee;color:#17311f}"
-		 ".hero{background:#dff4d8;color:#17311f;padding:24px 0 62px;border-bottom:4px solid #78c58a}"
-		 ".head{max-width:900px;margin:0 auto;padding:0 14px;display:flex;justify-content:space-between;align-items:center;gap:14px}"
-		 "main{max-width:900px;margin:-44px auto 24px;padding:0 14px}"
-		 "h1{font-size:26px;margin:0}.sub{font-size:13px;color:#4f6f58;margin-top:5px}"
-		 ".pill{border-radius:999px;padding:8px 11px;background:%s;color:#fff;font-size:13px;font-weight:bold}"
-		 ".panel{background:#fff;border:1px solid #cfe3ca;border-radius:8px;margin-bottom:14px;box-shadow:0 8px 22px rgba(49,101,61,.10);overflow:hidden}"
-		 ".pad{padding:17px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.kv{border:1px solid #d9ead6;border-radius:6px;padding:11px;background:#fbfef9}"
-		 ".k{font-size:11px;color:#63806a;margin-bottom:6px}.v{font-size:15px;font-weight:bold;word-break:break-all}"
-		 ".formtop{display:flex;justify-content:space-between;align-items:end;gap:12px;border-bottom:1px solid #dcebd8;padding:16px 17px;background:#f8fff5}.title{font-size:18px;font-weight:bold}"
-		 ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:12px}label{display:block;font-size:13px;font-weight:bold;margin:13px 0 6px}"
-		 "input{width:100%%;height:42px;border:1px solid #9fbea1;border-radius:6px;padding:10px;font-size:15px;background:#fff;outline:none}"
-		 "input:focus{border-color:#55a968;box-shadow:0 0 0 3px #dff4d8}.check{display:flex;gap:8px;align-items:center;margin:13px 0}.check input{width:auto;height:auto}.check label{margin:0}"
-		 ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}button{height:42px;border:0;border-radius:6px;background:#3d9b55;color:#fff;font-size:15px;font-weight:bold;padding:0 18px;cursor:pointer}"
-		 "button.alt{background:#6b806f}button.scan{background:#57a96c}.msg{background:#eef9e8;border:1px solid #b8ddb2;border-radius:8px;color:#285d35;padding:13px 16px;margin-bottom:14px}.hint{font-size:12px;color:#627868}"
-		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #dcebd8;padding:9px;vertical-align:top}th{color:#4f6f58;background:#f4fbf1}"
-		 "@media(max-width:700px){.head{align-items:flex-start}.grid,.twocol{grid-template-columns:1fr}.formtop{display:block}}"
-		 "</style></head><body><div class=\"hero\"><div class=\"head\"><div><h1>WPA Mini</h1><div class=\"sub\">精简 WiFi STA 连接控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
+		 "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f5f7f4;color:#18251d}"
+		 ".bar{background:#fff;border-bottom:1px solid #dde5de}.head{max-width:960px;margin:auto;padding:16px;display:flex;justify-content:space-between;align-items:center;gap:12px}"
+		 "main{max-width:960px;margin:16px auto 24px;padding:0 16px}.brand{font-size:21px;font-weight:700}.sub,.hint{font-size:12px;color:#66756b;margin-top:3px}"
+		 ".pill{border-radius:999px;padding:7px 11px;background:%s;color:#fff;font-size:13px;font-weight:700;white-space:nowrap}"
+		 ".layout{display:grid;grid-template-columns:1fr 1fr;gap:14px}.panel{background:#fff;border:1px solid #d9e2dc;border-radius:8px;margin-bottom:14px;box-shadow:0 4px 14px rgba(24,37,29,.05);overflow:hidden}"
+		 ".formtop{border-bottom:1px solid #e7ece8;padding:14px 16px}.title{font-size:16px;font-weight:700}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}"
+		 ".kv{border-bottom:1px solid #edf1ee;padding:8px 0}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:700;word-break:break-all;margin-top:3px}"
+		 ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:700;margin:11px 0 5px}"
+		 "input{width:100%%;height:40px;border:1px solid #b8c5bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none}"
+		 "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:600}"
+		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer}"
+		 "button.alt,button.scan{background:#fff;color:#2f7d4f}.msg{background:#f0f7f2;border:1px solid #cfe1d4;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px}.tablewrap{overflow:auto}"
+		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e7ece8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:700}"
+		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol{grid-template-columns:1fr}}"
+		 "</style></head><body><div class=\"bar\"><div class=\"head\"><div><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
 		 "%s%s%s"
-		 "<section class=\"panel\"><div class=\"pad\"><div class=\"grid\">"
+		 "<div class=\"layout\"><section class=\"panel\"><div class=\"formtop\"><div class=\"title\">连接状态</div><div class=\"hint\">当前无线接口和地址信息</div></div><div class=\"pad\"><div class=\"grid\">"
 		 "<div class=\"kv\"><div class=\"k\">接口</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">WPA 状态</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">SSID</div><div class=\"v\">%s</div></div>"
@@ -2452,7 +2449,7 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<div class=\"actions\"><button type=\"submit\">连接</button></div></form>"
 		 "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描</button></form>"
 		 "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form></div></div>"
-		 "</section>%s</main></body></html>",
+		 "</section></div>%s</main></body></html>",
 		 state_color,
 		 state_label,
 		 message ? "<section class=\"msg\">" : "",
