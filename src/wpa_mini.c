@@ -101,6 +101,8 @@ static void signal_dnsmasq_reload(const struct app_config *cfg);
 static void stop_relay(const struct app_config *cfg);
 static void set_cloexec(int fd);
 static void close_inherited_fds(void);
+static void refresh_usb_bridge_members(const struct app_config *cfg,
+				       const char *bridge);
 
 typedef void (*wpa_msg_cb_func)(void *ctx, int level, int global,
 				const char *txt, size_t len);
@@ -2860,16 +2862,23 @@ static void ipv4_from_host(uint32_t host, char *out, size_t outsz)
 	inet_ntop(AF_INET, &a, out, outsz);
 }
 
-static int write_udhcpd_conf(uint32_t net_host)
+static int write_udhcpd_conf(uint32_t net_host, const char *dns1,
+			     const char *dns2)
 {
 	FILE *fp;
 	char ip_start[INET_ADDRSTRLEN];
 	char ip_end[INET_ADDRSTRLEN];
 	char ip_router[INET_ADDRSTRLEN];
+	const char *use_dns1;
+	const char *use_dns2;
 
 	ipv4_from_host(net_host + 100, ip_start, sizeof(ip_start));
 	ipv4_from_host(net_host + 200, ip_end, sizeof(ip_end));
 	ipv4_from_host(net_host + 1, ip_router, sizeof(ip_router));
+	use_dns1 = (dns1 && *dns1 && valid_ipv4_or_empty(dns1)) ?
+		   dns1 : DEFAULT_DNS1;
+	use_dns2 = (dns2 && *dns2 && valid_ipv4_or_empty(dns2)) ?
+		   dns2 : DEFAULT_DNS2;
 	if (mkdir_parent(DEFAULT_UDHCPD_CONF) < 0)
 		return -1;
 	fp = fopen(DEFAULT_UDHCPD_CONF, "w");
@@ -2880,12 +2889,12 @@ static int write_udhcpd_conf(uint32_t net_host)
 		"end %s\n"
 		"interface br0\n"
 		"option subnet 255.255.255.0\n"
-		"option dns %s\n"
+		"option dns %s %s\n"
 		"option router %s\n"
 		"option lease 86400\n"
 		"pidfile /etc_rw/udhcpd.pid\n"
 		"lease_file /etc_rw/udhcpd.leases\n",
-		ip_start, ip_end, ip_router, ip_router);
+		ip_start, ip_end, use_dns1, use_dns2, ip_router);
 	if (fclose(fp) != 0)
 		return -1;
 	unlink(DEFAULT_UDHCPD_LEASES);
@@ -3016,7 +3025,8 @@ static int iface_net_host24(const char *iface, uint32_t *net_host)
 	return 0;
 }
 
-static int ensure_lan_dhcp(const struct app_config *cfg, const char *lan_if)
+static int ensure_lan_dhcp(const struct app_config *cfg, const char *lan_if,
+			   const char *dns1, const char *dns2)
 {
 	uint32_t net_host;
 
@@ -3025,7 +3035,7 @@ static int ensure_lan_dhcp(const struct app_config *cfg, const char *lan_if)
 			lan_if, errno);
 		return -1;
 	}
-	if (write_udhcpd_conf(net_host) < 0) {
+	if (write_udhcpd_conf(net_host, dns1, dns2) < 0) {
 		log_msg(cfg, "relay dhcp conf failed errno=%d", errno);
 		return -1;
 	}
@@ -3089,6 +3099,7 @@ static void refresh_usb_bridge_members(const struct app_config *cfg,
 }
 
 static int adjust_lan_subnet(const struct app_config *cfg, uint32_t net_host,
+			     const char *dns1, const char *dns2,
 			     char *new_subnet, size_t new_subnet_sz)
 {
 	char ip_router[INET_ADDRSTRLEN];
@@ -3102,7 +3113,7 @@ static int adjust_lan_subnet(const struct app_config *cfg, uint32_t net_host,
 	log_msg(cfg, "lan adjust requested br0=%s/24", ip_router);
 
 	stop_relay(cfg);
-	if (write_udhcpd_conf(net_host) < 0) {
+	if (write_udhcpd_conf(net_host, dns1, dns2) < 0) {
 		log_msg(cfg, "lan adjust udhcpd conf failed errno=%d", errno);
 		return -1;
 	}
@@ -3392,7 +3403,8 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 		log_msg(cfg, "relay subnet conflict detected: %s and %s share subnet",
 			cfg->iface, lan_if);
 		if (choose_lan_subnet(&net_host) < 0 ||
-		    adjust_lan_subnet(cfg, net_host, adjusted_subnet,
+		    adjust_lan_subnet(cfg, net_host, dns1, dns2,
+				      adjusted_subnet,
 				      sizeof(adjusted_subnet)) < 0) {
 			log_msg(cfg, "relay lan auto adjust failed errno=%d", errno);
 			errno = EINVAL;
@@ -3412,7 +3424,7 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 			lan_if, errno);
 		return -1;
 	}
-	if (ensure_lan_dhcp(cfg, lan_if) < 0)
+	if (ensure_lan_dhcp(cfg, lan_if, dns1, dns2) < 0)
 		return -1;
 
 	stop_relay(cfg);
@@ -3443,6 +3455,7 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 	relay_write_state(lan_if, subnet, cfg->iface, old_forward, nat_ok,
 			  fwd_ok);
 	sync_system_dns_for_relay(cfg, dns1, dns2);
+	refresh_usb_bridge_members(cfg, lan_if);
 	log_msg(cfg, "relay started lan=%s subnet=%s wan=%s old_forward=%d fwd=%d",
 		lan_if, subnet, cfg->iface, old_forward, fwd_ok);
 	return 0;
@@ -5418,7 +5431,13 @@ static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
 		render_page(fd, cfg, "没有找到可用的热点/USB 网段。", NULL);
 		return;
 	}
-	if (adjust_lan_subnet(cfg, net_host, new_subnet, sizeof(new_subnet)) < 0) {
+	read_dns_pair(cfg->dns_path, dns1, sizeof(dns1), dns2, sizeof(dns2));
+	if (!dns1[0])
+		snprintf(dns1, sizeof(dns1), "%s", DEFAULT_DNS1);
+	if (!dns2[0])
+		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
+	if (adjust_lan_subnet(cfg, net_host, dns1, dns2,
+			      new_subnet, sizeof(new_subnet)) < 0) {
 		render_page(fd, cfg, "热点/USB 网段调整失败，请查看日志。", NULL);
 		return;
 	}
@@ -5431,11 +5450,6 @@ static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
 			    NULL);
 		return;
 	}
-	read_dns_pair(cfg->dns_path, dns1, sizeof(dns1), dns2, sizeof(dns2));
-	if (!dns1[0])
-		snprintf(dns1, sizeof(dns1), "%s", DEFAULT_DNS1);
-	if (!dns2[0])
-		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
 	if (start_relay(cfg, dns1, dns2) < 0) {
 		render_page(fd, cfg,
 			    "热点/USB 网段已调整，但共享网络启用失败。",
