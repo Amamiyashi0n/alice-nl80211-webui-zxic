@@ -2183,6 +2183,14 @@ static int ensure_scan_engine(const struct app_config *cfg)
 	return start_engine_process(cfg);
 }
 
+static int scan_has_rows(const char *text)
+{
+	const char *p;
+
+	p = strchr(text, '\n');
+	return p && p[1];
+}
+
 static int run_scan(const struct app_config *cfg, char *out, size_t outsz)
 {
 	char *reply;
@@ -2214,16 +2222,22 @@ static int run_scan(const struct app_config *cfg, char *out, size_t outsz)
 	if (strncmp(reply, "OK", 2) != 0 && strncmp(reply, "FAIL-BUSY", 9) != 0)
 		goto out;
 
-	for (i = 0; i < 20; i++) {
+	for (i = 0; i < 32; i++) {
 		usleep(250000);
 		len = out_cap;
 		if (wpa_ctrl_request(cfg, "SCAN_RESULTS", out, &len, 1200) == 0 &&
-		    strstr(out, "\n")) {
+		    scan_has_rows(out)) {
 			log_msg(cfg, "scan results ready bytes=%lu",
 				(unsigned long)len);
 			ret = 0;
 			goto out;
 		}
+	}
+	len = out_cap;
+	if (wpa_ctrl_request(cfg, "SCAN_RESULTS", out, &len, 1200) == 0) {
+		log_msg(cfg, "scan results empty bytes=%lu", (unsigned long)len);
+		ret = 0;
+		goto out;
 	}
 	log_msg(cfg, "scan results timeout");
 out:
@@ -2411,33 +2425,29 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<title>WPA Mini</title>"
 		 "<style>"
 		 "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f5f7f4;color:#18251d}"
-		 ".bar{background:#fff;border-bottom:1px solid #dde5de}.head{max-width:960px;margin:auto;padding:16px;display:flex;justify-content:space-between;align-items:center;gap:12px}"
-		 "main{max-width:960px;margin:16px auto 24px;padding:0 16px}.brand{font-size:21px;font-weight:700}.sub,.hint{font-size:12px;color:#66756b;margin-top:3px}"
+		 "@keyframes rise{from{opacity:.65;transform:translateY(6px)}to{opacity:1;transform:none}}"
+		 ".bar{background:#fff;border-bottom:1px solid #dde5de}.head{max-width:980px;margin:auto;padding:16px;display:flex;justify-content:space-between;align-items:center;gap:12px}"
+		 "main{max-width:980px;margin:16px auto 24px;padding:0 16px}.brand{font-size:21px;font-weight:700}.sub,.hint{font-size:12px;color:#66756b;margin-top:3px}"
 		 ".pill{border-radius:999px;padding:7px 11px;background:%s;color:#fff;font-size:13px;font-weight:700;white-space:nowrap}"
-		 ".layout{display:grid;grid-template-columns:1fr 1fr;gap:14px}.panel{background:#fff;border:1px solid #d9e2dc;border-radius:8px;margin-bottom:14px;box-shadow:0 4px 14px rgba(24,37,29,.05);overflow:hidden}"
+		 ".summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:1.35fr .9fr;gap:14px}.panel{background:#fff;border:1px solid #d9e2dc;border-radius:8px;margin-bottom:14px;box-shadow:0 4px 14px rgba(24,37,29,.05);overflow:hidden;animation:rise .22s ease-out}"
 		 ".formtop{border-bottom:1px solid #e7ece8;padding:14px 16px}.title{font-size:16px;font-weight:700}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}"
-		 ".kv{border-bottom:1px solid #edf1ee;padding:8px 0}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:700;word-break:break-all;margin-top:3px}"
+		 ".kv{border-bottom:1px solid #edf1ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e2dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:700;word-break:break-all;margin-top:3px}"
 		 ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:700;margin:11px 0 5px}"
-		 "input{width:100%%;height:40px;border:1px solid #b8c5bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none}"
+		 "input{width:100%%;height:40px;border:1px solid #b8c5bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none;transition:border-color .15s,box-shadow .15s}"
 		 "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:600}"
-		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer}"
+		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s}button:hover{transform:translateY(-1px);background:#256f43}"
 		 "button.alt,button.scan{background:#fff;color:#2f7d4f}.msg{background:#f0f7f2;border:1px solid #cfe1d4;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px}.tablewrap{overflow:auto}"
 		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e7ece8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:700}"
-		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol{grid-template-columns:1fr}}"
+		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}}"
 		 "</style></head><body><div class=\"bar\"><div class=\"head\"><div><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
 		 "%s%s%s"
-		 "<div class=\"layout\"><section class=\"panel\"><div class=\"formtop\"><div class=\"title\">连接状态</div><div class=\"hint\">当前无线接口和地址信息</div></div><div class=\"pad\"><div class=\"grid\">"
+		 "<div class=\"summary\">"
 		 "<div class=\"kv\"><div class=\"k\">接口</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">WPA 状态</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">SSID</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">网关</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
-		 "</div></div></section>"
-		 "<section class=\"panel\"><div class=\"formtop\"><div><div class=\"title\">连接网络</div><div class=\"hint\">WPA/WPA2-PSK，使用 udhcpc 获取地址，DNS 文件：%s</div></div></div>"
+		 "</div>"
+		 "<div class=\"layout\"><section class=\"panel\"><div class=\"formtop\"><div><div class=\"title\">连接网络</div><div class=\"hint\">WPA/WPA2-PSK，DNS 文件：%s</div></div></div>"
 		 "<div class=\"pad\"><form method=\"post\" action=\"/connect\">"
 		 "<label>SSID</label><input name=\"ssid\" maxlength=\"32\" value=\"%s\" autocomplete=\"off\" required>"
 		 "<label>BSSID</label><input name=\"bssid\" maxlength=\"17\" placeholder=\"可选，锁定指定 AP\" autocomplete=\"off\">"
@@ -2447,9 +2457,15 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">隐藏 SSID</label></div>"
 		 "<div class=\"check\"><input id=\"route\" name=\"route\" value=\"1\" type=\"checkbox\"><label for=\"route\">使用 STA 作为默认路由</label></div>"
 		 "<div class=\"actions\"><button type=\"submit\">连接</button></div></form>"
-		 "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描</button></form>"
-		 "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form></div></div>"
-		 "</section></div>%s</main></body></html>",
+		 "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描 WiFi</button></form>"
+		 "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form></div></div></section>"
+		 "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">运行信息</div><div class=\"hint\">当前接口状态</div></div><div class=\"pad\"><div class=\"grid\">"
+		 "<div class=\"kv\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">网关</div><div class=\"v\">%s</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
+		 "</div></div></section></div>%s</main></body></html>",
 		 state_color,
 		 state_label,
 		 message ? "<section class=\"msg\">" : "",
@@ -2458,14 +2474,14 @@ static void render_page(int fd, const struct app_config *cfg,
 		 esc_iface,
 		 esc_state,
 		 esc_ssid[0] ? esc_ssid : "-",
-		 esc_bssid[0] ? esc_bssid : "-",
 		 esc_ip[0] ? esc_ip : "-",
+		 esc_dns_path,
+		 esc_ssid,
+		 esc_bssid[0] ? esc_bssid : "-",
 		 esc_gw[0] ? esc_gw : "-",
 		 esc_dns[0] ? esc_dns : "-",
 		 st.engine_running ? (long)st.engine_pid : 0L,
 		 st.dhcp_running ? (long)st.dhcp_pid : 0L,
-		 esc_dns_path,
-		 esc_ssid,
 		 scan_html);
 
 	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);

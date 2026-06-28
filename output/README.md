@@ -7,7 +7,7 @@
 - `wpa_mini`: 目标设备使用的 ARM 32-bit 静态可执行文件，已 strip。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `448944` 字节。它是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `449496` 字节。它是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
 
 ## 功能
 
