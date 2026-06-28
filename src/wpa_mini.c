@@ -45,9 +45,9 @@
 #define CTRL_REPLY_MAX 16384
 #define STATUS_REPLY_MAX 2048
 #define SCAN_TEXT_MAX 16384
-#define SCAN_HTML_MAX 20000
+#define SCAN_HTML_MAX 28000
 #define SAVED_HTML_MAX 12000
-#define PAGE_BODY_MAX 49152
+#define PAGE_BODY_MAX 65536
 #define SAVED_WIFI_MAX 8
 
 #ifndef MSG_NOSIGNAL
@@ -1837,6 +1837,28 @@ static void url_decode(char *out, size_t outsz, const char *in, size_t inlen)
 	out[used] = '\0';
 }
 
+static void decode_escaped_ssid(char *out, size_t outsz, const char *in)
+{
+	size_t used = 0;
+
+	if (!outsz)
+		return;
+
+	while (*in && used + 1 < outsz) {
+		if (in[0] == '\\' && in[1] == 'x' &&
+		    isxdigit((unsigned char)in[2]) &&
+		    isxdigit((unsigned char)in[3])) {
+			int hi = hex_value(in[2]);
+			int lo = hex_value(in[3]);
+			out[used++] = (char)((hi << 4) | lo);
+			in += 4;
+		} else {
+			out[used++] = *in++;
+		}
+	}
+	out[used] = '\0';
+}
+
 static int form_value(const char *body, const char *key,
 		      char *out, size_t outsz)
 {
@@ -2498,7 +2520,7 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 		   "<div class=\"title\">附近 WiFi</div>"
 		   "<div class=\"hint\">扫描结果来自当前 STA 接口</div>"
 		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
-		   "<th>SSID</th><th>信号</th><th>安全</th><th>BSSID</th>"
+		   "<th>SSID</th><th>信号</th><th>安全</th><th>BSSID</th><th>操作</th>"
 		   "</tr></thead><tbody>");
 
 	line = strtok_r(copy, "\n", &save);
@@ -2506,6 +2528,7 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 		char *fields[5];
 		char *p = line;
 		int i;
+		char decoded_ssid[96];
 		char esc_ssid[256], esc_flags[256], esc_bssid[128], esc_signal[64];
 
 		for (i = 0; i < 4; i++) {
@@ -2520,18 +2543,21 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 		fields[4] = p;
 		if (!fields[4][0])
 			continue;
+		decode_escaped_ssid(decoded_ssid, sizeof(decoded_ssid), fields[4]);
 		html_escape(esc_bssid, sizeof(esc_bssid), fields[0]);
 		html_escape(esc_signal, sizeof(esc_signal), fields[2]);
 		html_escape(esc_flags, sizeof(esc_flags), fields[3]);
-		html_escape(esc_ssid, sizeof(esc_ssid), fields[4]);
+		html_escape(esc_ssid, sizeof(esc_ssid), decoded_ssid);
 		buf_append(out, outsz,
-			   "<tr><td>%s</td><td>%s dBm</td><td>%s</td><td>%s</td></tr>",
-			   esc_ssid, esc_signal, esc_flags, esc_bssid);
+			   "<tr><td class=\"ssidcell\">%s</td><td>%s dBm</td><td>%s</td><td>%s</td>"
+			   "<td><button class=\"pick\" type=\"button\" data-ssid=\"%s\" data-bssid=\"%s\" onclick=\"pickNet(this)\">选择</button></td></tr>",
+			   esc_ssid, esc_signal, esc_flags, esc_bssid, esc_ssid,
+			   esc_bssid);
 		rows++;
 	}
 
 	if (!rows)
-		buf_append(out, outsz, "<tr><td colspan=\"4\">未发现网络</td></tr>");
+		buf_append(out, outsz, "<tr><td colspan=\"5\">未发现网络</td></tr>");
 	buf_append(out, outsz, "</tbody></table></div></section>");
 	free(copy);
 }
@@ -2639,18 +2665,19 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<style>"
 		 "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f5f7f4;color:#18251d}"
 		 "@keyframes rise{from{opacity:.65;transform:translateY(6px)}to{opacity:1;transform:none}}"
+		 "@keyframes pulse{0%%{box-shadow:0 0 0 0 rgba(47,125,79,.32)}100%%{box-shadow:0 0 0 14px rgba(47,125,79,0)}}"
 		 ".bar{background:#fff;border-bottom:1px solid #dde5de}.head{max-width:980px;margin:auto;padding:16px;display:flex;justify-content:space-between;align-items:center;gap:12px}"
 		 "main{max-width:980px;margin:16px auto 24px;padding:0 16px}.brand{font-size:21px;font-weight:700}.sub,.hint{font-size:12px;color:#66756b;margin-top:3px}"
 		 ".pill{border-radius:999px;padding:7px 11px;background:%s;color:#fff;font-size:13px;font-weight:700;white-space:nowrap}"
-		 ".summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:1.35fr .9fr;gap:14px}.panel{background:#fff;border:1px solid #d9e2dc;border-radius:8px;margin-bottom:14px;box-shadow:0 4px 14px rgba(24,37,29,.05);overflow:hidden;animation:rise .22s ease-out}"
+		 ".summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:1.35fr .9fr;gap:14px}.panel{background:#fff;border:1px solid #d9e2dc;border-radius:8px;margin-bottom:14px;box-shadow:0 4px 14px rgba(24,37,29,.05);overflow:hidden;animation:rise .22s ease-out}.panel.hot{animation:pulse .7s ease-out}"
 		 ".formtop{border-bottom:1px solid #e7ece8;padding:14px 16px}.title{font-size:16px;font-weight:700}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}"
 		 ".kv{border-bottom:1px solid #edf1ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e2dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:700;word-break:break-all;margin-top:3px}"
 		 ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:700;margin:11px 0 5px}"
 		 "input{width:100%%;height:40px;border:1px solid #b8c5bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none;transition:border-color .15s,box-shadow .15s}"
 		 "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:600}"
-		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s}button:hover{transform:translateY(-1px);background:#256f43}"
+		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}"
 		 "button.alt,button.scan{background:#fff;color:#2f7d4f}.msg{background:#f0f7f2;border:1px solid #cfe1d4;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px}.tablewrap{overflow:auto}"
-		 ".saved{border:1px solid #edf1ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}"
+		 ".saved{border:1px solid #edf1ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:700;color:#1d3b29}"
 		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e7ece8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:700}"
 		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}}"
 		 "</style></head><body><div class=\"bar\"><div class=\"head\"><div><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
@@ -2661,11 +2688,11 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<div class=\"kv\"><div class=\"k\">SSID</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>"
 		 "</div>"
-		 "<div class=\"layout\"><section class=\"panel\"><div class=\"formtop\"><div><div class=\"title\">连接网络</div><div class=\"hint\">WPA/WPA2-PSK，DNS 文件：%s</div></div></div>"
+		 "<div class=\"layout\"><section class=\"panel\" id=\"connectPanel\"><div class=\"formtop\"><div><div class=\"title\">连接网络</div><div class=\"hint\">WPA/WPA2-PSK，DNS 文件：%s</div></div></div>"
 		 "<div class=\"pad\"><form method=\"post\" action=\"/connect\">"
-		 "<label>SSID</label><input name=\"ssid\" maxlength=\"32\" value=\"%s\" autocomplete=\"off\" required>"
-		 "<label>BSSID</label><input name=\"bssid\" maxlength=\"17\" placeholder=\"可选，锁定指定 AP\" autocomplete=\"off\">"
-		 "<label>密码或 64 位 HEX PSK</label><input name=\"psk\" type=\"password\" autocomplete=\"off\" required>"
+		 "<label>SSID</label><input id=\"ssidInput\" name=\"ssid\" maxlength=\"32\" value=\"%s\" autocomplete=\"off\" required>"
+		 "<label>BSSID</label><input id=\"bssidInput\" name=\"bssid\" maxlength=\"17\" placeholder=\"可选，锁定指定 AP\" autocomplete=\"off\">"
+		 "<label>密码或 64 位 HEX PSK</label><input id=\"pskInput\" name=\"psk\" type=\"password\" autocomplete=\"off\" required>"
 		 "<div class=\"twocol\"><div><label>DNS 1</label><input name=\"dns1\" value=\"" DEFAULT_DNS1 "\" inputmode=\"decimal\"></div>"
 		 "<div><label>DNS 2</label><input name=\"dns2\" value=\"" DEFAULT_DNS2 "\" inputmode=\"decimal\"></div></div>"
 		 "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">隐藏 SSID</label></div>"
@@ -2679,7 +2706,11 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
-		 "</div></div></section></div>%s%s</main></body></html>",
+		 "</div></div></section></div>%s%s</main>"
+		 "<script>"
+		 "function pickNet(b){var s=document.getElementById('ssidInput'),m=document.getElementById('bssidInput'),p=document.getElementById('pskInput'),c=document.getElementById('connectPanel');if(s)s.value=b.getAttribute('data-ssid')||'';if(m)m.value=b.getAttribute('data-bssid')||'';if(c){c.classList.remove('hot');void c.offsetWidth;c.classList.add('hot');c.scrollIntoView({behavior:'smooth',block:'start'});}if(p)p.focus();}"
+		 "document.addEventListener('submit',function(e){var b=e.target.querySelector('button[type=submit]');if(b){b.classList.add('busy');b.textContent=b.textContent+'...';}});"
+		 "</script></body></html>",
 		 state_color,
 		 state_label,
 		 message ? "<section class=\"msg\">" : "",

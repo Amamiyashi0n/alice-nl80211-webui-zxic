@@ -8,7 +8,7 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `453448` 字节，`wpa_mini.run` 大小为 `317412` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `454768` 字节，`wpa_mini.run` 大小为 `318201` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
 
 ## 功能
 
