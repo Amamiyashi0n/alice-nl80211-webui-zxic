@@ -8,7 +8,7 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `454768` 字节，`wpa_mini.run` 大小为 `318201` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `461624` 字节，`wpa_mini.run` 大小为 `322392` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
 
 ## 功能
 
@@ -22,6 +22,7 @@
 - 调用目标系统 `/sbin/udhcpc` 获取 DHCP。
 - 写入 DNS 到 `/mnt/userdata/etc_rw/resolv.conf`，默认使用阿里 `223.5.5.5` 和腾讯 `119.29.29.29`。
 - 可选是否把 STA 作为默认路由，默认不接管，避免破坏厂商原有网络。
+- WebUI 可启用或关闭开机自启动。
 
 默认 WebUI 监听：
 
@@ -97,6 +98,9 @@ chmod +x /mnt/userdata/wpa_mini.run
 | 默认 DNS2 | `119.29.29.29` |
 | 日志文件 | `/tmp/wpa_mini.log` |
 | driver | `nl80211` |
+| 持久启动包 | `/mnt/userdata/wpa_mini.run` |
+| 自启动脚本 | `/mnt/userdata/wpa_mini_autostart.sh` |
+| 系统启动钩子 | `/etc/rc` |
 
 ## WebUI 操作
 
@@ -118,7 +122,8 @@ http://<设备IP>:51400/
 6. 点击 `连接`。
 7. 连接成功后，该 WiFi 会出现在 `已保存 WiFi` 区域。
 8. 后续可在 `已保存 WiFi` 中点击 `连接` 一键重连，或点击 `删除` 移除记录。
-9. 需要断开时点击 `断开`。
+9. 如需开机后自动启动 WebUI，确认 `/mnt/userdata/wpa_mini.run` 存在并可读，然后点击 `启用自启动`。
+10. 需要断开时点击 `断开`。
 
 ## HTTP 接口
 
@@ -184,6 +189,13 @@ curl -X POST \
 
 ```sh
 curl -X POST http://127.0.0.1:51400/disconnect
+```
+
+启用或关闭开机自启动：
+
+```sh
+curl -X POST http://127.0.0.1:51400/autostart_on
+curl -X POST http://127.0.0.1:51400/autostart_off
 ```
 
 ## 命令行一次性连接
@@ -344,29 +356,25 @@ make distclean
 
 ## 开机自启动
 
-推荐把自解压包放在持久分区：
+WebUI 的 `启用自启动` 按钮会执行两步：
+
+- 写入 `/mnt/userdata/wpa_mini_autostart.sh`。
+- 尝试在 `/etc/rc` 末尾写入带标记的启动钩子。
+
+启动钩子只会包含 `# wpa_mini autostart begin` 到 `# wpa_mini autostart end` 之间的内容，关闭自启动时也只移除这段标记块。若根分区仍不可写，WebUI 会提示系统启动钩子写入失败；此时持久启动脚本可能已经写入，但真正开机自启动不会生效。
+
+启用前需要先把自解压包放到持久路径：
 
 ```sh
-/mnt/userdata/wpa_mini.run
+cp wpa_mini.run /mnt/userdata/wpa_mini.run
+chmod +x /mnt/userdata/wpa_mini.run
 ```
 
-手动验证启动命令：
+开机后自启动脚本会尝试把 `/tmp` remount 为可执行，然后启动：
 
 ```sh
-/mnt/userdata/wpa_mini.run -h >/dev/null 2>&1
-/mnt/userdata/wpa_mini.run -w -i wlan0-vxd >/tmp/wpa_mini_boot.log 2>&1 &
+/mnt/userdata/wpa_mini.run -w -i wlan0-vxd
 ```
-
-这台设备没有标准 `/etc/init.d`、`rc.local` 或 `crond` 用户钩子。若确认允许修改只读 rootfs 的 `/etc/rc`，建议只在 `/etc/rc` 末尾加入 guarded hook：
-
-```sh
-if [ -x /mnt/userdata/wpa_mini.run ]; then
-    /mnt/userdata/wpa_mini.run -h >/dev/null 2>&1
-    /mnt/userdata/wpa_mini.run -w -i wlan0-vxd >/tmp/wpa_mini_boot.log 2>&1 &
-fi
-```
-
-不要修改 `/etc/inittab` 为 respawn，也不要劫持厂商业务脚本。正式写入 `/etc/rc` 前应先准备备份和回滚命令。
 
 ## 安全注意
 
