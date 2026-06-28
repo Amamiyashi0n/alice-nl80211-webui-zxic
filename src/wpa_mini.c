@@ -2316,10 +2316,10 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 	snprintf(copy, SCAN_TEXT_MAX, "%s", scan_text);
 	buf_append(out, outsz,
 		   "<section class=\"panel\"><div class=\"formtop\"><div>"
-		   "<div class=\"title\">Scan results</div>"
-		   "<div class=\"hint\">SSID list from the internal STA engine</div>"
+		   "<div class=\"title\">扫描结果</div>"
+		   "<div class=\"hint\">由内置 STA 引擎返回的附近热点</div>"
 		   "</div></div><div class=\"pad\"><table><thead><tr>"
-		   "<th>SSID</th><th>Signal</th><th>Security</th><th>BSSID</th>"
+		   "<th>SSID</th><th>信号</th><th>安全</th><th>BSSID</th>"
 		   "</tr></thead><tbody>");
 
 	line = strtok_r(copy, "\n", &save);
@@ -2352,7 +2352,7 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 	}
 
 	if (!rows)
-		buf_append(out, outsz, "<tr><td colspan=\"4\">No networks found</td></tr>");
+		buf_append(out, outsz, "<tr><td colspan=\"4\">未发现网络</td></tr>");
 	buf_append(out, outsz, "</tbody></table></div></section>");
 	free(copy);
 }
@@ -2400,58 +2400,58 @@ static void render_page(int fd, const struct app_config *cfg,
 	html_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
 	build_scan_html(scan_text, scan_html, SCAN_HTML_MAX);
 
-	state_color = strcmp(st.wpa_state, "COMPLETED") == 0 ? "#127c3d" :
-		      st.engine_running ? "#a15c00" : "#b42318";
-	state_label = strcmp(st.wpa_state, "COMPLETED") == 0 ? "connected" :
-		      st.engine_running ? "working" : "stopped";
+	state_color = strcmp(st.wpa_state, "COMPLETED") == 0 ? "#2f8f46" :
+		      st.engine_running ? "#9a6a00" : "#9b2f2f";
+	state_label = strcmp(st.wpa_state, "COMPLETED") == 0 ? "已连接" :
+		      st.engine_running ? "连接中" : "已停止";
 
 	snprintf(body, PAGE_BODY_MAX,
 		 "<!doctype html><html><head><meta charset=\"utf-8\">"
 		 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 		 "<title>WPA Mini</title>"
 		 "<style>"
-		 "*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:#eef1f4;color:#111827}"
-		 ".hero{background:#17202a;color:white;padding:24px 0 62px;border-bottom:4px solid #2aa876}"
+		 "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f1f8ee;color:#17311f}"
+		 ".hero{background:#dff4d8;color:#17311f;padding:24px 0 62px;border-bottom:4px solid #78c58a}"
 		 ".head{max-width:900px;margin:0 auto;padding:0 14px;display:flex;justify-content:space-between;align-items:center;gap:14px}"
 		 "main{max-width:900px;margin:-44px auto 24px;padding:0 14px}"
-		 "h1{font-size:26px;margin:0}.sub{font-size:13px;color:#cbd5df;margin-top:5px}"
+		 "h1{font-size:26px;margin:0}.sub{font-size:13px;color:#4f6f58;margin-top:5px}"
 		 ".pill{border-radius:999px;padding:8px 11px;background:%s;color:#fff;font-size:13px;font-weight:bold}"
-		 ".panel{background:#fff;border:1px solid #d8dee6;border-radius:8px;margin-bottom:14px;box-shadow:0 8px 24px rgba(15,23,42,.10);overflow:hidden}"
-		 ".pad{padding:17px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.kv{border:1px solid #e4e8ee;border-radius:6px;padding:11px;background:#fafbfc}"
-		 ".k{font-size:11px;text-transform:uppercase;color:#6b7280;letter-spacing:.04em;margin-bottom:6px}.v{font-size:15px;font-weight:bold;word-break:break-all}"
-		 ".formtop{display:flex;justify-content:space-between;align-items:end;gap:12px;border-bottom:1px solid #edf0f3;padding:16px 17px;background:#fbfcfd}.title{font-size:18px;font-weight:bold}"
+		 ".panel{background:#fff;border:1px solid #cfe3ca;border-radius:8px;margin-bottom:14px;box-shadow:0 8px 22px rgba(49,101,61,.10);overflow:hidden}"
+		 ".pad{padding:17px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.kv{border:1px solid #d9ead6;border-radius:6px;padding:11px;background:#fbfef9}"
+		 ".k{font-size:11px;color:#63806a;margin-bottom:6px}.v{font-size:15px;font-weight:bold;word-break:break-all}"
+		 ".formtop{display:flex;justify-content:space-between;align-items:end;gap:12px;border-bottom:1px solid #dcebd8;padding:16px 17px;background:#f8fff5}.title{font-size:18px;font-weight:bold}"
 		 ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:12px}label{display:block;font-size:13px;font-weight:bold;margin:13px 0 6px}"
-		 "input{width:100%%;height:42px;border:1px solid #aeb8c2;border-radius:6px;padding:10px;font-size:15px;background:#fff;outline:none}"
-		 "input:focus{border-color:#2b7cff;box-shadow:0 0 0 3px #dbeafe}.check{display:flex;gap:8px;align-items:center;margin:13px 0}.check input{width:auto;height:auto}.check label{margin:0}"
-		 ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}button{height:42px;border:0;border-radius:6px;background:#1769e0;color:#fff;font-size:15px;font-weight:bold;padding:0 18px;cursor:pointer}"
-		 "button.alt{background:#4b5563}button.scan{background:#08715f}.msg{background:#eaf4ff;border:1px solid #a9d0ff;border-radius:8px;color:#0f3b63;padding:13px 16px;margin-bottom:14px}.hint{font-size:12px;color:#667085}"
-		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e5e7eb;padding:9px;vertical-align:top}th{color:#475467;background:#f8fafc}"
+		 "input{width:100%%;height:42px;border:1px solid #9fbea1;border-radius:6px;padding:10px;font-size:15px;background:#fff;outline:none}"
+		 "input:focus{border-color:#55a968;box-shadow:0 0 0 3px #dff4d8}.check{display:flex;gap:8px;align-items:center;margin:13px 0}.check input{width:auto;height:auto}.check label{margin:0}"
+		 ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}button{height:42px;border:0;border-radius:6px;background:#3d9b55;color:#fff;font-size:15px;font-weight:bold;padding:0 18px;cursor:pointer}"
+		 "button.alt{background:#6b806f}button.scan{background:#57a96c}.msg{background:#eef9e8;border:1px solid #b8ddb2;border-radius:8px;color:#285d35;padding:13px 16px;margin-bottom:14px}.hint{font-size:12px;color:#627868}"
+		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #dcebd8;padding:9px;vertical-align:top}th{color:#4f6f58;background:#f4fbf1}"
 		 "@media(max-width:700px){.head{align-items:flex-start}.grid,.twocol{grid-template-columns:1fr}.formtop{display:block}}"
-		 "</style></head><body><div class=\"hero\"><div class=\"head\"><div><h1>WPA Mini</h1><div class=\"sub\">Single-binary WiFi STA control</div></div><div class=\"pill\">%s</div></div></div><main>"
+		 "</style></head><body><div class=\"hero\"><div class=\"head\"><div><h1>WPA Mini</h1><div class=\"sub\">精简 WiFi STA 连接控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
 		 "%s%s%s"
 		 "<section class=\"panel\"><div class=\"pad\"><div class=\"grid\">"
-		 "<div class=\"kv\"><div class=\"k\">Interface</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">WPA State</div><div class=\"v\">%s</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">接口</div><div class=\"v\">%s</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">WPA 状态</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">SSID</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">Gateway</div><div class=\"v\">%s</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">网关</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">Engine PID</div><div class=\"v\">%ld</div></div>"
+		 "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
 		 "</div></div></section>"
-		 "<section class=\"panel\"><div class=\"formtop\"><div><div class=\"title\">Connect network</div><div class=\"hint\">WPA/WPA2-PSK, DHCP via udhcpc, DNS file %s</div></div></div>"
+		 "<section class=\"panel\"><div class=\"formtop\"><div><div class=\"title\">连接网络</div><div class=\"hint\">WPA/WPA2-PSK，使用 udhcpc 获取地址，DNS 文件：%s</div></div></div>"
 		 "<div class=\"pad\"><form method=\"post\" action=\"/connect\">"
 		 "<label>SSID</label><input name=\"ssid\" maxlength=\"32\" value=\"%s\" autocomplete=\"off\" required>"
-		 "<label>BSSID</label><input name=\"bssid\" maxlength=\"17\" placeholder=\"optional\" autocomplete=\"off\">"
-		 "<label>Password or 64-hex PSK</label><input name=\"psk\" type=\"password\" autocomplete=\"off\" required>"
+		 "<label>BSSID</label><input name=\"bssid\" maxlength=\"17\" placeholder=\"可选，锁定指定 AP\" autocomplete=\"off\">"
+		 "<label>密码或 64 位 HEX PSK</label><input name=\"psk\" type=\"password\" autocomplete=\"off\" required>"
 		 "<div class=\"twocol\"><div><label>DNS 1</label><input name=\"dns1\" value=\"" DEFAULT_DNS1 "\" inputmode=\"decimal\"></div>"
 		 "<div><label>DNS 2</label><input name=\"dns2\" value=\"" DEFAULT_DNS2 "\" inputmode=\"decimal\"></div></div>"
-		 "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">Hidden SSID</label></div>"
-		 "<div class=\"check\"><input id=\"route\" name=\"route\" value=\"1\" type=\"checkbox\"><label for=\"route\">Use STA as default route</label></div>"
-		 "<div class=\"actions\"><button type=\"submit\">Connect</button></div></form>"
-		 "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">Scan</button></form>"
-		 "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">Disconnect</button></form></div></div>"
+		 "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">隐藏 SSID</label></div>"
+		 "<div class=\"check\"><input id=\"route\" name=\"route\" value=\"1\" type=\"checkbox\"><label for=\"route\">使用 STA 作为默认路由</label></div>"
+		 "<div class=\"actions\"><button type=\"submit\">连接</button></div></form>"
+		 "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描</button></form>"
+		 "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form></div></div>"
 		 "</section>%s</main></body></html>",
 		 state_color,
 		 state_label,
@@ -2578,18 +2578,18 @@ static void handle_connect(int fd, const struct app_config *cfg,
 
 	if (!valid_ipv4_or_empty(dns1) || !valid_ipv4_or_empty(dns2)) {
 		log_msg(cfg, "connect rejected: invalid dns");
-		render_page(fd, cfg, "DNS must be valid IPv4 addresses.", NULL);
+		render_page(fd, cfg, "DNS 必须是有效的 IPv4 地址。", NULL);
 		return;
 	}
 	if (!valid_bssid_or_empty(bssid)) {
 		log_msg(cfg, "connect rejected: invalid bssid");
-		render_page(fd, cfg, "BSSID must be empty or a MAC address.", NULL);
+		render_page(fd, cfg, "BSSID 可以留空，填写时必须是 MAC 地址格式。", NULL);
 		return;
 	}
 
 	if (write_config(cfg->conf, cfg->ctrl_dir, ssid, psk, bssid, hidden) < 0) {
 		log_msg(cfg, "connect rejected: config write failed errno=%d", errno);
-		render_page(fd, cfg, "Failed to write config. Check SSID and password length.", NULL);
+		render_page(fd, cfg, "配置写入失败，请检查 SSID 和密码长度。", NULL);
 		return;
 	}
 
@@ -2597,24 +2597,24 @@ static void handle_connect(int fd, const struct app_config *cfg,
 	deconfigure_iface(cfg);
 
 	if (start_engine_process(cfg) < 0) {
-		render_page(fd, cfg, "Config written, but internal WPA engine did not start.", NULL);
+		render_page(fd, cfg, "配置已写入，但内置 WPA 引擎启动失败。", NULL);
 		return;
 	}
 
 	if (wait_wpa_completed(cfg, 20000) < 0) {
 		stop_engine(cfg);
-		render_page(fd, cfg, "Internal WPA engine started, but association is not completed yet.", NULL);
+		render_page(fd, cfg, "内置 WPA 引擎已启动，但无线关联尚未完成。", NULL);
 		return;
 	}
 
 	if (start_dhcp(cfg, dns1, dns2, use_route) < 0) {
-		render_page(fd, cfg, "WiFi is connected, but udhcpc did not start.", NULL);
+		render_page(fd, cfg, "WiFi 已连接，但 udhcpc 启动失败。", NULL);
 		return;
 	}
 
 	if (wait_ipv4_ready(cfg, 8000) < 0) {
 		log_msg(cfg, "connect warning: DHCP no IP yet");
-		render_page(fd, cfg, "WiFi is connected, but DHCP has not assigned an IP yet.", NULL);
+		render_page(fd, cfg, "WiFi 已连接，但 DHCP 暂未分配 IP。", NULL);
 		return;
 	}
 
@@ -2634,7 +2634,7 @@ static void handle_scan_page(int fd, const struct app_config *cfg)
 	}
 	if (run_scan(cfg, scan, SCAN_TEXT_MAX) < 0) {
 		free(scan);
-		render_page(fd, cfg, "Scan failed. Check interface and internal engine state.", NULL);
+		render_page(fd, cfg, "扫描失败，请检查接口和内置引擎状态。", NULL);
 		return;
 	}
 	render_page(fd, cfg, NULL, scan);
