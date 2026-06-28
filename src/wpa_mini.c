@@ -69,6 +69,7 @@
 #define SYS_ARP_MAX 24
 #define SYS_LISTEN_MAX 24
 #define SYS_FS_MAX 8
+#define RELAY_IFACES_TEXT_MAX 128
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -98,6 +99,8 @@ static char engine_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 static int mkdir_parent(const char *path);
 static void signal_dnsmasq_reload(const struct app_config *cfg);
 static void stop_relay(const struct app_config *cfg);
+static void set_cloexec(int fd);
+static void close_inherited_fds(void);
 
 typedef void (*wpa_msg_cb_func)(void *ctx, int level, int global,
 				const char *txt, size_t len);
@@ -146,10 +149,12 @@ struct runtime_status {
 	int sta_lan_conflict;
 	int relay_enabled;
 	char relay_lan_iface[IFNAMSIZ];
+	char relay_lan_members[RELAY_IFACES_TEXT_MAX];
 	char relay_lan_subnet[64];
 	char relay_wan_iface[IFNAMSIZ];
 	int relay_ip_forward;
 	int relay_nat_rule;
+	int relay_dhcp_running;
 };
 
 struct saved_wifi {
@@ -1586,6 +1591,7 @@ static int start_engine_process(const struct app_config *cfg)
 			if (fd > STDERR_FILENO)
 				close(fd);
 		}
+		close_inherited_fds();
 
 		optind = 1;
 		argv[n++] = "wpa_mini_engine";
@@ -1782,6 +1788,7 @@ static int start_dhcp(const struct app_config *cfg,
 			if (fd > STDERR_FILENO)
 				close(fd);
 		}
+		close_inherited_fds();
 
 		execl(cfg->udhcpc, cfg->udhcpc,
 		      "-i", cfg->iface,
@@ -2559,6 +2566,7 @@ static int run_quiet(char *const argv[])
 			if (fd > STDERR_FILENO)
 				close(fd);
 		}
+		close_inherited_fds();
 		execvp(argv[0], argv);
 		_exit(127);
 	}
@@ -2659,6 +2667,29 @@ static int write_int_file(const char *path, int value)
 	if (fclose(fp) != 0)
 		rc = -1;
 	return rc;
+}
+
+static void set_cloexec(int fd)
+{
+	int flags;
+
+	if (fd < 0)
+		return;
+	flags = fcntl(fd, F_GETFD);
+	if (flags >= 0)
+		fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static void close_inherited_fds(void)
+{
+	long max_fd;
+	int fd;
+
+	max_fd = sysconf(_SC_OPEN_MAX);
+	if (max_fd < 0 || max_fd > 256)
+		max_fd = 256;
+	for (fd = 3; fd < max_fd; fd++)
+		close(fd);
 }
 
 static int read_iface_ipv4_net(const char *iface, struct in_addr *ip,
@@ -2774,16 +2805,21 @@ static int subnet_conflicts_addr(uint32_t net_host)
 	while ((de = readdir(dir)) != NULL) {
 		struct in_addr ip;
 		struct in_addr ifmask;
-		uint32_t ifnet;
+		uint32_t if_ip;
+		uint32_t if_mask;
+		uint32_t if_net;
 
 		if (de->d_name[0] == '.')
 			continue;
 		if (read_iface_ipv4_net(de->d_name, &ip, &ifmask) < 0)
 			continue;
-		if (ntohl(ifmask.s_addr) != mask)
+		if_ip = ntohl(ip.s_addr);
+		if_mask = ntohl(ifmask.s_addr);
+		if (if_ip == 0 || if_mask == 0)
 			continue;
-		ifnet = ntohl(ip.s_addr) & mask;
-		if (ifnet == net_host) {
+		if_net = if_ip & if_mask;
+		if ((net_host & if_mask) == if_net ||
+		    (if_net & mask) == net_host) {
 			closedir(dir);
 			return 1;
 		}
@@ -2794,20 +2830,22 @@ static int subnet_conflicts_addr(uint32_t net_host)
 
 static int choose_lan_subnet(uint32_t *net_host_out)
 {
-	static const uint32_t candidates[] = {
-		0xc0a83200U, /* 192.168.50.0/24 */
-		0xc0a83300U, /* 192.168.51.0/24 */
-		0xc0a86400U, /* 192.168.100.0/24 */
-		0xc0a8c800U, /* 192.168.200.0/24 */
-		0xac100a00U, /* 172.16.10.0/24 */
-		0x0a2a0000U, /* 10.42.0.0/24 */
-		0x0a630000U  /* 10.99.0.0/24 */
-	};
-	size_t i;
+	int i;
 
-	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-		if (!subnet_conflicts_addr(candidates[i])) {
-			*net_host_out = candidates[i];
+	for (i = 0; i <= 255; i++) {
+		uint32_t candidate = 0xc0a80000U | ((uint32_t)i << 8);
+
+		if (!subnet_conflicts_addr(candidate)) {
+			*net_host_out = candidate;
+			return 0;
+		}
+	}
+
+	for (i = 16; i <= 31; i++) {
+		uint32_t candidate = 0xac000000U | ((uint32_t)i << 16);
+
+		if (!subnet_conflicts_addr(candidate)) {
+			*net_host_out = candidate;
 			return 0;
 		}
 	}
@@ -2900,6 +2938,7 @@ static int start_udhcpd_process(void)
 			if (fd > STDERR_FILENO)
 				close(fd);
 		}
+		close_inherited_fds();
 		if (strcmp(exe, "/bin/busybox") == 0)
 			execl(exe, exe, "udhcpd", "-f", DEFAULT_UDHCPD_CONF,
 			      (char *)NULL);
@@ -2911,10 +2950,142 @@ static int start_udhcpd_process(void)
 	return 0;
 }
 
+static int udhcpd_running(void)
+{
+	FILE *fp;
+	char line[256];
+	int found = 0;
+
+	fp = popen("ps 2>/dev/null", "r");
+	if (!fp)
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		if (strstr(line, "udhcpd") && strstr(line, DEFAULT_UDHCPD_CONF)) {
+			found = 1;
+			break;
+		}
+	}
+	pclose(fp);
+	return found;
+}
+
+static void stop_udhcpd_process(void)
+{
+	FILE *fp;
+	char line[256];
+
+	fp = popen("ps 2>/dev/null", "r");
+	if (!fp)
+		return;
+	while (fgets(line, sizeof(line), fp)) {
+		long pid;
+		char *end;
+
+		if (!strstr(line, "udhcpd") || !strstr(line, DEFAULT_UDHCPD_CONF))
+			continue;
+		errno = 0;
+		pid = strtol(line, &end, 10);
+		if (pid > 1 && !errno)
+			kill((pid_t)pid, SIGTERM);
+	}
+	pclose(fp);
+	usleep(150000);
+}
+
 static int restart_udhcpd(void)
 {
-	system("for p in $(ps | grep '[u]dhcpd -f /etc_rw/udhcpd.conf' | awk '{print $1}'); do kill $p 2>/dev/null; done");
-	return start_udhcpd_process();
+	stop_udhcpd_process();
+	if (start_udhcpd_process() < 0)
+		return -1;
+	usleep(250000);
+	return udhcpd_running() ? 0 : -1;
+}
+
+static int iface_net_host24(const char *iface, uint32_t *net_host)
+{
+	struct in_addr ip;
+	struct in_addr mask;
+
+	if (read_iface_ipv4_net(iface, &ip, &mask) < 0)
+		return -1;
+	if (mask_to_prefix(mask) != 24) {
+		errno = EINVAL;
+		return -1;
+	}
+	*net_host = ntohl(ip.s_addr & mask.s_addr);
+	return 0;
+}
+
+static int ensure_lan_dhcp(const struct app_config *cfg, const char *lan_if)
+{
+	uint32_t net_host;
+
+	if (iface_net_host24(lan_if, &net_host) < 0) {
+		log_msg(cfg, "relay dhcp failed: %s is not a /24 lan errno=%d",
+			lan_if, errno);
+		return -1;
+	}
+	if (write_udhcpd_conf(net_host) < 0) {
+		log_msg(cfg, "relay dhcp conf failed errno=%d", errno);
+		return -1;
+	}
+	if (restart_udhcpd() < 0) {
+		log_msg(cfg, "relay dhcp start failed errno=%d", errno);
+		return -1;
+	}
+	log_msg(cfg, "relay dhcp ready lan=%s", lan_if);
+	return 0;
+}
+
+static void bridge_members_text(const char *bridge, char *out, size_t outsz)
+{
+	DIR *dir;
+	struct dirent *de;
+	char path[PATH_MAX];
+
+	if (outsz)
+		out[0] = '\0';
+	snprintf(path, sizeof(path), "/sys/class/net/%s/brif", bridge);
+	dir = opendir(path);
+	if (!dir)
+		return;
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_name[0] == '.')
+			continue;
+		if (out[0])
+			buf_append(out, outsz, ",");
+		buf_append(out, outsz, "%s", de->d_name);
+	}
+	closedir(dir);
+}
+
+static void refresh_usb_bridge_members(const struct app_config *cfg,
+				       const char *bridge)
+{
+	DIR *dir;
+	struct dirent *de;
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/brif", bridge);
+	dir = opendir(path);
+	if (!dir)
+		return;
+	while ((de = readdir(dir)) != NULL) {
+		char *down_args[] = { de->d_name, "down", NULL };
+		char *up_args[] = { de->d_name, "up", NULL };
+
+		if (de->d_name[0] == '.')
+			continue;
+		if (strncmp(de->d_name, "usb", 3) != 0 &&
+		    strncmp(de->d_name, "usblan", 6) != 0)
+			continue;
+		log_msg(cfg, "lan adjust refreshing usb member=%s",
+			de->d_name);
+		run_tool_quiet("ifconfig", down_args);
+		usleep(200000);
+		run_tool_quiet("ifconfig", up_args);
+	}
+	closedir(dir);
 }
 
 static int adjust_lan_subnet(const struct app_config *cfg, uint32_t net_host,
@@ -2943,6 +3114,7 @@ static int adjust_lan_subnet(const struct app_config *cfg, uint32_t net_host,
 		log_msg(cfg, "lan adjust udhcpd restart failed errno=%d", errno);
 		return -1;
 	}
+	refresh_usb_bridge_members(cfg, "br0");
 	signal_dnsmasq_reload(cfg);
 	fp = fopen(DEFAULT_LAN_ADJUST_STATE, "w");
 	if (fp) {
@@ -3000,6 +3172,31 @@ static int add_relay_rule(const char *chain, const char *src,
 	return iptables_rule(src && *src ? fwd_src_args : fwd_args);
 }
 
+static int add_bridge_member_forward_rules(const char *bridge,
+					   const char *subnet,
+					   const char *wan_if)
+{
+	DIR *dir;
+	struct dirent *de;
+	char path[PATH_MAX];
+	int ok = 1;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/brif", bridge);
+	dir = opendir(path);
+	if (!dir)
+		return 1;
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_name[0] == '.')
+			continue;
+		if (add_relay_rule("FORWARD", subnet, de->d_name, wan_if, 0) < 0)
+			ok = 0;
+		if (add_relay_rule("FORWARD", "", wan_if, de->d_name, 0) < 0)
+			ok = 0;
+	}
+	closedir(dir);
+	return ok ? 0 : -1;
+}
+
 static void delete_relay_rule(const char *chain, const char *src,
 			      const char *in_if, const char *out_if, int nat)
 {
@@ -3019,6 +3216,27 @@ static void delete_relay_rule(const char *chain, const char *src,
 				  (src && *src ? fwd_src_args : fwd_args)) < 0)
 			break;
 	}
+}
+
+static void delete_bridge_member_forward_rules(const char *bridge,
+					       const char *subnet,
+					       const char *wan_if)
+{
+	DIR *dir;
+	struct dirent *de;
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/brif", bridge);
+	dir = opendir(path);
+	if (!dir)
+		return;
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_name[0] == '.')
+			continue;
+		delete_relay_rule("FORWARD", subnet, de->d_name, wan_if, 0);
+		delete_relay_rule("FORWARD", "", wan_if, de->d_name, 0);
+	}
+	closedir(dir);
 }
 
 static void signal_dnsmasq_reload(const struct app_config *cfg)
@@ -3151,6 +3369,7 @@ static void stop_relay(const struct app_config *cfg)
 	if (fwd_rule) {
 		delete_relay_rule("FORWARD", subnet, lan_if, wan_if, 0);
 		delete_relay_rule("FORWARD", "", wan_if, lan_if, 0);
+		delete_bridge_member_forward_rules(lan_if, subnet, wan_if);
 	}
 	if (old_forward == 0 || old_forward == 1)
 		write_int_file("/proc/sys/net/ipv4/ip_forward", old_forward);
@@ -3162,15 +3381,25 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 {
 	const char *lan_if = "br0";
 	char subnet[64];
+	char adjusted_subnet[64];
 	int old_forward;
 	int nat_ok = 0;
 	int fwd_ok = 0;
 
 	if (ifaces_same_subnet(cfg->iface, lan_if)) {
-		log_msg(cfg, "relay start failed: %s and %s share subnet",
+		uint32_t net_host;
+
+		log_msg(cfg, "relay subnet conflict detected: %s and %s share subnet",
 			cfg->iface, lan_if);
-		errno = EINVAL;
-		return -1;
+		if (choose_lan_subnet(&net_host) < 0 ||
+		    adjust_lan_subnet(cfg, net_host, adjusted_subnet,
+				      sizeof(adjusted_subnet)) < 0) {
+			log_msg(cfg, "relay lan auto adjust failed errno=%d", errno);
+			errno = EINVAL;
+			return -1;
+		}
+		log_msg(cfg, "relay lan auto adjusted subnet=%s",
+			adjusted_subnet);
 	}
 	if (!iface_has_default_route(cfg->iface)) {
 		log_msg(cfg, "relay start failed: no default route on %s",
@@ -3183,6 +3412,8 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 			lan_if, errno);
 		return -1;
 	}
+	if (ensure_lan_dhcp(cfg, lan_if) < 0)
+		return -1;
 
 	stop_relay(cfg);
 	old_forward = read_int_file("/proc/sys/net/ipv4/ip_forward", 0);
@@ -3199,12 +3430,14 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 	}
 	nat_ok = 1;
 	if (add_relay_rule("FORWARD", subnet, lan_if, cfg->iface, 0) == 0 &&
-	    add_relay_rule("FORWARD", "", cfg->iface, lan_if, 0) == 0) {
+	    add_relay_rule("FORWARD", "", cfg->iface, lan_if, 0) == 0 &&
+	    add_bridge_member_forward_rules(lan_if, subnet, cfg->iface) == 0) {
 		fwd_ok = 1;
 	} else {
 		log_msg(cfg, "relay forward rule warning errno=%d", errno);
 		delete_relay_rule("FORWARD", subnet, lan_if, cfg->iface, 0);
 		delete_relay_rule("FORWARD", "", cfg->iface, lan_if, 0);
+		delete_bridge_member_forward_rules(lan_if, subnet, cfg->iface);
 	}
 
 	relay_write_state(lan_if, subnet, cfg->iface, old_forward, nat_ok,
@@ -3233,16 +3466,20 @@ static void get_relay_status(const struct app_config *cfg,
 		return;
 	snprintf(st->relay_lan_iface, sizeof(st->relay_lan_iface), "%s",
 		 lan_if);
+	bridge_members_text(lan_if, st->relay_lan_members,
+			    sizeof(st->relay_lan_members));
 	snprintf(st->relay_lan_subnet, sizeof(st->relay_lan_subnet), "%s",
 		 subnet);
 	snprintf(st->relay_wan_iface, sizeof(st->relay_wan_iface), "%s",
 		 wan_if);
 	st->relay_nat_rule =
 		relay_rule_exists("POSTROUTING", subnet, lan_if, wan_if, 1);
+	st->relay_dhcp_running = udhcpd_running();
 	st->relay_enabled = st->engine_running &&
 			    strcmp(st->wpa_state, "COMPLETED") == 0 &&
 			    st->ip[0] &&
 			    st->relay_ip_forward == 1 && st->relay_nat_rule &&
+			    st->relay_dhcp_running &&
 			    !st->sta_lan_conflict && st->default_route_ready;
 	(void)cfg;
 	(void)old_forward;
@@ -4571,6 +4808,7 @@ static void append_home_content(char *body, size_t bodysz,
 	char esc_ssid[256], esc_iface[128], esc_state[128], esc_bssid[128];
 	char esc_ip[128], esc_gw[128], esc_dns[256], esc_dns_path[512];
 	char esc_relay_lan[128], esc_relay_subnet[128], esc_relay_wan[128];
+	char esc_relay_members[256];
 	char esc_sta_subnet[128], esc_lan_subnet[128];
 	const char *connect_hint;
 	const char *share_state;
@@ -4590,6 +4828,8 @@ static void append_home_content(char *body, size_t bodysz,
 	html_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
 	html_escape(esc_relay_lan, sizeof(esc_relay_lan),
 		    st->relay_lan_iface[0] ? st->relay_lan_iface : "br0");
+	html_escape(esc_relay_members, sizeof(esc_relay_members),
+		    st->relay_lan_members[0] ? st->relay_lan_members : "-");
 	html_escape(esc_relay_subnet, sizeof(esc_relay_subnet),
 		    st->relay_lan_subnet[0] ? st->relay_lan_subnet : "-");
 	html_escape(esc_relay_wan, sizeof(esc_relay_wan),
@@ -4599,22 +4839,22 @@ static void append_home_content(char *body, size_t bodysz,
 	html_escape(esc_lan_subnet, sizeof(esc_lan_subnet),
 		    st->lan_subnet[0] ? st->lan_subnet : "-");
 	connected = runtime_is_connected(st);
-	share_ready = connected && st->default_route_ready &&
-		      !st->sta_lan_conflict;
-	connect_hint = share_ready ? "本设备已通过这个 WiFi 获取地址并具备出口路由" :
+	share_ready = connected && st->default_route_ready;
+	connect_hint = share_ready && !st->sta_lan_conflict ?
+		       "本设备已通过这个 WiFi 获取地址并具备出口路由" :
 		       st->sta_lan_conflict ?
-		       "已关联 WiFi，但上游网段和热点/USB 网段冲突" :
+		       "已关联 WiFi，但上游网段和热点/USB 网段冲突；开启共享时会自动调整热点/USB 网段" :
 		       connected && !st->default_route_ready ?
 		       "已关联 WiFi，但没有默认网关，暂不能作为外网出口" :
 		       "本设备已通过这个 WiFi 获取地址";
-	share_state = st->sta_lan_conflict ? "网段冲突" :
+	share_state = st->sta_lan_conflict ? "需调整网段" :
 		      connected && !st->default_route_ready ? "缺少网关" :
 		      st->relay_enabled ? "已开启" : "未开启";
 	share_action = st->relay_enabled ? "/relay_off" :
-		       st->sta_lan_conflict ? "/relay_fix_lan" : "/relay_on";
+		       "/relay_on";
 	share_button = st->relay_enabled ? "关闭共享网络" :
 		       st->sta_lan_conflict ?
-		       "调整热点/USB 网段并继续共享" :
+		       "自动调整网段并共享网络" :
 		       "共享网络给热点和 USB 设备";
 	share_class = st->relay_enabled ? " class=\"alt\"" : "";
 
@@ -4676,8 +4916,9 @@ static void append_home_content(char *body, size_t bodysz,
 		   "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">中继/NAT</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">下层网络</div><div class=\"v\">%s %s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">热点/USB 接口</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">上游出口</div><div class=\"v\">%s</div></div>"
-		   "<div class=\"kv\"><div class=\"k\">ip_forward / NAT</div><div class=\"v\">%d / %s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">ip_forward / NAT / DHCP</div><div class=\"v\">%d / %s / %s</div></div>"
 		   "</div></div></section></div>%s%s%s",
 		   esc_bssid[0] ? esc_bssid : "-",
 		   esc_gw[0] ? esc_gw : "-",
@@ -4686,9 +4927,11 @@ static void append_home_content(char *body, size_t bodysz,
 		   st->dhcp_running ? (long)st->dhcp_pid : 0L,
 		   st->relay_enabled ? "已启用" : "未启用",
 		   esc_relay_lan, esc_relay_subnet,
+		   esc_relay_members,
 		   esc_relay_wan,
 		   st->relay_ip_forward,
 		   st->relay_nat_rule ? "存在" : "无",
+		   st->relay_dhcp_running ? "运行" : "停止",
 		   autostart_html, saved_html, scan_html);
 }
 
@@ -4796,6 +5039,7 @@ static void render_status(int fd, const struct app_config *cfg)
 	char esc_gw[128], esc_dns[256], esc_key[128], esc_iface[128];
 	char esc_dns_path[512], esc_relay_lan[128], esc_relay_subnet[128];
 	char esc_relay_wan[128], esc_sta_subnet[128], esc_lan_subnet[128];
+	char esc_relay_members[256];
 	char body[4096];
 
 	log_msg(cfg, "render status");
@@ -4810,6 +5054,8 @@ static void render_status(int fd, const struct app_config *cfg)
 	json_escape(esc_key, sizeof(esc_key), st.key_mgmt);
 	json_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
 	json_escape(esc_relay_lan, sizeof(esc_relay_lan), st.relay_lan_iface);
+	json_escape(esc_relay_members, sizeof(esc_relay_members),
+		    st.relay_lan_members);
 	json_escape(esc_relay_subnet, sizeof(esc_relay_subnet),
 		    st.relay_lan_subnet);
 	json_escape(esc_relay_wan, sizeof(esc_relay_wan), st.relay_wan_iface);
@@ -4825,8 +5071,10 @@ static void render_status(int fd, const struct app_config *cfg)
 		 "\"sta_subnet\":\"%s\",\"lan_subnet\":\"%s\","
 		 "\"default_route_ready\":%s,\"sta_lan_conflict\":%s,"
 		 "\"relay_enabled\":%s,\"relay_lan_iface\":\"%s\","
-		 "\"relay_lan_subnet\":\"%s\",\"relay_wan_iface\":\"%s\","
+		 "\"relay_lan_members\":\"%s\",\"relay_lan_subnet\":\"%s\","
+		 "\"relay_wan_iface\":\"%s\","
 		 "\"relay_ip_forward\":%d,\"relay_nat_rule\":%s,"
+		 "\"relay_dhcp_running\":%s,"
 		 "\"port\":%d}\n",
 		 st.engine_running ? "true" : "false",
 		 st.engine_running ? (long)st.engine_pid : 0L,
@@ -4838,9 +5086,11 @@ static void render_status(int fd, const struct app_config *cfg)
 		 st.default_route_ready ? "true" : "false",
 		 st.sta_lan_conflict ? "true" : "false",
 		 st.relay_enabled ? "true" : "false",
-		 esc_relay_lan, esc_relay_subnet, esc_relay_wan,
+		 esc_relay_lan, esc_relay_members, esc_relay_subnet,
+		 esc_relay_wan,
 		 st.relay_ip_forward,
 		 st.relay_nat_rule ? "true" : "false",
+		 st.relay_dhcp_running ? "true" : "false",
 		 cfg->port);
 	http_send(fd, cfg, 200, "OK", "application/json", body);
 }
@@ -5125,12 +5375,6 @@ static void handle_relay_on(int fd, const struct app_config *cfg)
 		render_page(fd, cfg, "请先连接 WiFi，获取 IP 后才能共享网络。", NULL);
 		return;
 	}
-	if (st.sta_lan_conflict) {
-		render_page(fd, cfg,
-			    "不能开启共享网络：上游 WiFi 网段和本机热点/USB 网段相同，请更换上游 WiFi 或调整本机 LAN 网段。",
-			    NULL);
-		return;
-	}
 	if (!st.default_route_ready) {
 		render_page(fd, cfg,
 			    "不能开启共享网络：当前 WiFi 没有默认网关，设备还不能通过它访问外网。",
@@ -5368,6 +5612,7 @@ static int run_webui(const struct app_config *cfg)
 		perror("socket");
 		return 1;
 	}
+	set_cloexec(s);
 
 	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -5405,6 +5650,7 @@ static int run_webui(const struct app_config *cfg)
 			log_msg(cfg, "accept failed errno=%d", errno);
 			break;
 		}
+		set_cloexec(c);
 		log_msg(cfg, "accept ok fd=%d", c);
 		handle_client(c, cfg);
 		close(c);
