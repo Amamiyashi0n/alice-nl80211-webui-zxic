@@ -8,22 +8,24 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `476792` 字节，`wpa_mini.run` 大小为 `332617` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `491632` 字节，`wpa_mini.run` 大小为 `341289` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
 
 ## 功能
 
 `wpa_mini` 提供一个 WebUI，用于控制 WiFi STA 连接：
 
-- 中文轻量设备控制台页面。
+- 中文轻量设备控制台页面，带侧边栏导航。
 - 扫描周围 WiFi。
 - 连接 WPA/WPA2-PSK 网络。
 - 连接成功后记忆 WiFi，并可在 WebUI 一键重连或删除。
-- 可选锁定 BSSID。
+- BSSID 仅在扫描结果和状态中只读显示，连接时由系统自动选择具体 AP。
 - 调用目标系统 `/sbin/udhcpc` 获取 DHCP。
 - 写入 DNS 到 `/mnt/userdata/etc_rw/resolv.conf`，默认使用阿里 `223.5.5.5` 和腾讯 `119.29.29.29`。
-- 可选是否把 STA 作为默认路由，默认不接管，避免破坏厂商原有网络。
+- 默认让本设备通过连接的 WiFi STA 出网。
+- 可选共享网络给热点和 USB 设备：下层 `br0` 网络中的 WiFi AP 客户端和 USB 客户端通过 `wlan0-vxd` 出网，连接后也可单独开启或关闭。
+- 检测到上游 WiFi 和热点/USB 网段冲突时会提示用户；用户确认后可自动把热点/USB 网段调整到不冲突的私有网段，并继续开启共享。
 - WebUI 可启用或关闭开机自启动。
-- WebUI 只读展示目标系统状态、全部网络接口、路由、ARP、监听端口和关键挂载分区。
+- WebUI 拆分为控制台、网络接口、系统信息三个页面，只读展示目标系统状态、全部网络接口、路由、ARP、监听端口和关键挂载分区。
 
 默认 WebUI 监听：
 
@@ -95,6 +97,7 @@ chmod +x /mnt/userdata/wpa_mini.run
 | DHCP 脚本 | `/tmp/wpa_mini_udhcpc.sh` |
 | DNS 文件 | `/mnt/userdata/etc_rw/resolv.conf` |
 | 已保存 WiFi | `/mnt/userdata/etc_rw/wpa_mini_saved.conf` |
+| 中继状态 | `/tmp/wpa_mini_relay.state` |
 | 默认 DNS1 | `223.5.5.5` |
 | 默认 DNS2 | `119.29.29.29` |
 | 日志文件 | `/tmp/wpa_mini.log` |
@@ -117,15 +120,18 @@ chmod +x /mnt/userdata/wpa_mini.run
 http://<设备IP>:51400/
 ```
 
-3. 点击 `扫描 WiFi` 扫描附近热点。
-4. 输入 SSID 和密码，必要时填写 BSSID、DNS1/DNS2。
-5. 如需让设备默认从 WiFi STA 出网，勾选 `使用 STA 作为默认路由`；默认不要勾选。
-6. 点击 `连接`。
-7. 连接成功后，该 WiFi 会出现在 `已保存 WiFi` 区域。
-8. 后续可在 `已保存 WiFi` 中点击 `连接` 一键重连，或点击 `删除` 移除记录。
-9. 如需开机后自动启动 WebUI，确认 `/mnt/userdata/wpa_mini.run` 存在并可读，然后点击 `启用自启动`。
-10. 在 `系统状态` 和 `网络接口` 区域查看原系统接口，例如 `wan1` 到 `wan8`、`br0`、`usblan0`、`wlan0`、`wlan0-vxd`。
-11. 需要断开时点击 `断开`。
+3. 在 `控制台` 页面点击 `扫描 WiFi` 扫描附近热点。
+4. 输入 SSID 和密码，必要时调整 DNS1/DNS2。BSSID 不需要填写，系统会自动选择具体 AP。
+5. 如需连接成功后立即让热点或 USB 网口设备也能上网，勾选 `连接后共享网络给热点和 USB 设备`。
+6. 点击 `连接`。连接成功后，本设备会自动通过这个 WiFi 访问外网。
+7. 连接成功后，主面板会切换为 `当前连接`，可直接点击 `共享网络给热点和 USB 设备` 或 `关闭共享网络`。
+   如果提示网段冲突，可点击 `调整热点/USB 网段并继续共享`，程序会自动选择一个不冲突的本地网段并重启 `udhcpd`。
+8. 连接成功后，该 WiFi 会出现在 `已保存 WiFi` 区域。
+9. 后续可在 `已保存 WiFi` 中点击 `连接` 一键重连，或点击 `删除` 移除记录。
+10. 如需开机后自动启动 WebUI，确认 `/mnt/userdata/wpa_mini.run` 存在并可读，然后点击 `启用自启动`。
+11. 在侧边栏进入 `网络接口` 页面查看原系统接口，例如 `wan1` 到 `wan8`、`br0`、`usblan0`、`wlan0`、`wlan0-vxd`，以及路由和 ARP。
+12. 在侧边栏进入 `系统信息` 页面查看主机状态、监听端口和关键挂载分区。
+13. 需要断开时点击 `断开`；断开会清理 `wpa_mini` 创建的中继 NAT 规则。
 
 ## HTTP 接口
 
@@ -139,6 +145,18 @@ curl http://127.0.0.1:51400/status
 
 ```sh
 curl http://127.0.0.1:51400/system
+```
+
+查看 HTML 网络接口页面：
+
+```sh
+curl http://127.0.0.1:51400/interfaces
+```
+
+查看 HTML 系统信息页面：
+
+```sh
+curl http://127.0.0.1:51400/system_page
 ```
 
 扫描 WiFi：
@@ -155,14 +173,6 @@ curl -X POST \
   http://127.0.0.1:51400/connect
 ```
 
-指定 BSSID：
-
-```sh
-curl -X POST \
-  -d 'ssid=MyWiFi&psk=password123&bssid=00:11:22:33:44:55' \
-  http://127.0.0.1:51400/connect
-```
-
 连接隐藏 SSID：
 
 ```sh
@@ -171,12 +181,25 @@ curl -X POST \
   http://127.0.0.1:51400/connect
 ```
 
-连接并启用默认路由：
+连接并共享网络给热点和 USB 设备：
 
 ```sh
 curl -X POST \
-  -d 'ssid=MyWiFi&psk=password123&route=1' \
+  -d 'ssid=MyWiFi&psk=password123&relay=1' \
   http://127.0.0.1:51400/connect
+```
+
+已连接后开启或关闭共享网络：
+
+```sh
+curl -X POST http://127.0.0.1:51400/relay_on
+curl -X POST http://127.0.0.1:51400/relay_off
+```
+
+已连接但上下游网段冲突时，调整热点/USB 网段并继续共享：
+
+```sh
+curl -X POST http://127.0.0.1:51400/relay_fix_lan
 ```
 
 使用已保存 WiFi 连接，`idx` 是 WebUI 中保存列表的顺序，从 `0` 开始：
@@ -189,7 +212,7 @@ curl -X POST -d 'idx=0' http://127.0.0.1:51400/connect_saved
 
 ```sh
 curl -X POST \
-  -d 'ssid=MyWiFi&bssid=' \
+  -d 'ssid=MyWiFi' \
   http://127.0.0.1:51400/forget
 ```
 
@@ -226,10 +249,16 @@ curl -X POST http://127.0.0.1:51400/autostart_off
 /tmp/wpa_mini -i wlan0-vxd -s MyWiFi -p 'password123' -H
 ```
 
-连接后启用默认路由：
+一次性连接后让本设备通过这个 WiFi 上网：
 
 ```sh
 /tmp/wpa_mini -i wlan0-vxd -s MyWiFi -p 'password123' -M
+```
+
+连接后共享网络给热点和 USB 设备：
+
+```sh
+/tmp/wpa_mini -i wlan0-vxd -s MyWiFi -p 'password123' -N
 ```
 
 ## 生成的 WPA 配置
@@ -286,9 +315,17 @@ nameserver 223.5.5.5
 nameserver 119.29.29.29
 ```
 
+启用 WiFi 中继/NAT 时，程序会：
+
+- 开启 IPv4 转发：`/proc/sys/net/ipv4/ip_forward`。
+- 添加 `iptables` NAT：`br0` 下层网段经 `wlan0-vxd` 做 `MASQUERADE`。
+- 尝试添加 FORWARD 放行规则；若系统默认已放行，规则失败只记录日志。
+- 同步 `/etc_rw/resolv.conf` 并通知 `dnsmasq` 重载，因为系统 `dnsmasq -i br0 -r /etc_rw/resolv.conf` 会服务下层客户端。
+- 断开或下次重连前只删除 `wpa_mini` 自己创建的精确匹配规则，不清空系统防火墙。
+
 ## 已保存 WiFi
 
-WebUI 连接成功后会把 SSID、密码、BSSID、DNS、隐藏 SSID 和默认路由选项保存到：
+WebUI 连接成功后会把 SSID、密码、DNS、隐藏 SSID 和共享网络选项保存到：
 
 ```sh
 /mnt/userdata/etc_rw/wpa_mini_saved.conf
@@ -358,6 +395,7 @@ make distclean
 
 - 目标设备需要有可用无线接口，例如 `wlan0-vxd`。
 - 目标设备需要存在 `/sbin/udhcpc`。
+- 使用 WiFi 中继/NAT 时，目标设备需要存在 `iptables`，并保留系统原有 `br0`、`dnsmasq`、`udhcpd` 服务。
 - 使用 `wpa_mini.run` 时，目标设备需要存在 `awk`，以及 `zcat`、`gunzip` 或 BusyBox `gunzip`。
 - 程序通常需要 root 权限或足够的网络控制权限。
 - 设备防火墙需要允许访问 `51400` 端口。

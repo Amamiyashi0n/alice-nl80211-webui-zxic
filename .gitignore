@@ -10,6 +10,7 @@
 /tmp/
 /wpa_mini
 /wpa_mini_test
+/agent/
 
 # Editor and OS noise
 *~

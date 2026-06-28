@@ -35,7 +35,12 @@
 #define DEFAULT_DHCP_PIDFILE "/tmp/wpa_mini_udhcpc.pid"
 #define DEFAULT_DHCP_SCRIPT "/tmp/wpa_mini_udhcpc.sh"
 #define DEFAULT_DNS_PATH "/mnt/userdata/etc_rw/resolv.conf"
+#define SYSTEM_DNS_PATH "/etc_rw/resolv.conf"
 #define DEFAULT_SAVED_PATH "/mnt/userdata/etc_rw/wpa_mini_saved.conf"
+#define DEFAULT_RELAY_STATE "/tmp/wpa_mini_relay.state"
+#define DEFAULT_LAN_ADJUST_STATE "/tmp/wpa_mini_lan_adjust.state"
+#define DEFAULT_UDHCPD_CONF "/etc_rw/udhcpd.conf"
+#define DEFAULT_UDHCPD_LEASES "/etc_rw/udhcpd.leases"
 #define DEFAULT_RUN_PATH "/mnt/userdata/wpa_mini.run"
 #define DEFAULT_AUTOSTART_SCRIPT "/mnt/userdata/wpa_mini_autostart.sh"
 #define DEFAULT_AUTOSTART_RC "/etc/rc"
@@ -91,6 +96,8 @@ static char signal_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 static char engine_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 
 static int mkdir_parent(const char *path);
+static void signal_dnsmasq_reload(const struct app_config *cfg);
+static void stop_relay(const struct app_config *cfg);
 
 typedef void (*wpa_msg_cb_func)(void *ctx, int level, int global,
 				const char *txt, size_t len);
@@ -133,16 +140,26 @@ struct runtime_status {
 	char ip[64];
 	char gateway[64];
 	char dns[192];
+	char sta_subnet[64];
+	char lan_subnet[64];
+	int default_route_ready;
+	int sta_lan_conflict;
+	int relay_enabled;
+	char relay_lan_iface[IFNAMSIZ];
+	char relay_lan_subnet[64];
+	char relay_wan_iface[IFNAMSIZ];
+	int relay_ip_forward;
+	int relay_nat_rule;
 };
 
 struct saved_wifi {
 	char ssid[96];
 	char psk[128];
-	char bssid[32];
 	char dns1[64];
 	char dns2[64];
 	int hidden;
 	int route;
+	int relay;
 };
 
 struct autostart_status {
@@ -274,6 +291,7 @@ static void usage(FILE *out)
 		"  -u PATH    udhcpc path; default is /sbin/udhcpc\n"
 		"  -H         set scan_ssid=1 for hidden SSIDs in one-shot mode\n"
 		"  -M         add default route through STA after DHCP in one-shot mode\n"
+		"  -N         enable WiFi relay/NAT from br0 to STA; implies -M\n"
 		"  -F         keep foreground parent alive in one-shot mode\n"
 		"  -n         write/check config only in one-shot mode\n"
 		"  -h         show this help\n");
@@ -1126,30 +1144,8 @@ static int write_base_config(const char *path, const char *ctrl_dir)
 	return 0;
 }
 
-static int valid_bssid_or_empty(const char *s)
-{
-	int i;
-
-	if (!s || !*s)
-		return 1;
-	if (strlen(s) != 17)
-		return 0;
-
-	for (i = 0; i < 17; i++) {
-		if ((i + 1) % 3 == 0) {
-			if (s[i] != ':')
-				return 0;
-		} else if (!isxdigit((unsigned char)s[i])) {
-			return 0;
-		}
-	}
-
-	return 1;
-}
-
 static int write_config(const char *path, const char *ctrl_dir,
-			const char *ssid, const char *psk,
-			const char *bssid, int hidden)
+			const char *ssid, const char *psk, int hidden)
 {
 	int fd;
 	FILE *fp;
@@ -1193,8 +1189,6 @@ static int write_config(const char *path, const char *ctrl_dir,
 	fprintf(fp, "\tssid=");
 	write_quoted(fp, ssid);
 	fprintf(fp, "\n");
-	if (bssid && *bssid)
-		fprintf(fp, "\tbssid=%s\n", bssid);
 	if (hidden)
 		fprintf(fp, "\tscan_ssid=1\n");
 	fprintf(fp, "\tkey_mgmt=WPA-PSK\n");
@@ -2022,6 +2016,8 @@ static int load_saved_wifi(struct saved_wifi *items, int max_items)
 		struct saved_wifi item;
 		char value[16];
 		size_t len;
+		int duplicate = 0;
+		int i;
 
 		memset(&item, 0, sizeof(item));
 		len = strcspn(line, "\r\n");
@@ -2029,16 +2025,26 @@ static int load_saved_wifi(struct saved_wifi *items, int max_items)
 		if (!form_value(line, "ssid", item.ssid, sizeof(item.ssid)) ||
 		    !form_value(line, "psk", item.psk, sizeof(item.psk)))
 			continue;
-		form_value(line, "bssid", item.bssid, sizeof(item.bssid));
 		form_value(line, "dns1", item.dns1, sizeof(item.dns1));
 		form_value(line, "dns2", item.dns2, sizeof(item.dns2));
 		item.hidden = form_value(line, "hidden", value, sizeof(value)) &&
 			      value[0] == '1';
-		item.route = form_value(line, "route", value, sizeof(value)) &&
+		item.route = form_value(line, "route", value, sizeof(value)) ?
+			     value[0] == '1' : 1;
+		item.relay = form_value(line, "relay", value, sizeof(value)) &&
 			     value[0] == '1';
-		if (!valid_psk(item.psk) || !valid_bssid_or_empty(item.bssid) ||
-		    !valid_ipv4_or_empty(item.dns1) ||
+		if (item.relay)
+			item.route = 1;
+		if (!valid_psk(item.psk) || !valid_ipv4_or_empty(item.dns1) ||
 		    !valid_ipv4_or_empty(item.dns2))
+			continue;
+		for (i = 0; i < count; i++) {
+			if (strcmp(items[i].ssid, item.ssid) == 0) {
+				duplicate = 1;
+				break;
+			}
+		}
+		if (duplicate)
 			continue;
 		items[count++] = item;
 	}
@@ -2066,16 +2072,15 @@ static int save_saved_wifi(const struct saved_wifi *items, int count)
 	}
 
 	for (i = 0; i < count; i++) {
-		char ssid[288], psk[384], bssid[96], dns1[192], dns2[192];
+		char ssid[288], psk[384], dns1[192], dns2[192];
 
 		url_encode(ssid, sizeof(ssid), items[i].ssid);
 		url_encode(psk, sizeof(psk), items[i].psk);
-		url_encode(bssid, sizeof(bssid), items[i].bssid);
 		url_encode(dns1, sizeof(dns1), items[i].dns1);
 		url_encode(dns2, sizeof(dns2), items[i].dns2);
-		fprintf(fp, "ssid=%s&psk=%s&bssid=%s&dns1=%s&dns2=%s&hidden=%d&route=%d\n",
-			ssid, psk, bssid, dns1, dns2, items[i].hidden ? 1 : 0,
-			items[i].route ? 1 : 0);
+		fprintf(fp, "ssid=%s&psk=%s&dns1=%s&dns2=%s&hidden=%d&route=%d&relay=%d\n",
+			ssid, psk, dns1, dns2, items[i].hidden ? 1 : 0,
+			items[i].route ? 1 : 0, items[i].relay ? 1 : 0);
 	}
 
 	if (fclose(fp) != 0)
@@ -2085,8 +2090,8 @@ static int save_saved_wifi(const struct saved_wifi *items, int count)
 }
 
 static void remember_wifi(const char *ssid, const char *psk,
-			  const char *bssid, const char *dns1,
-			  const char *dns2, int hidden, int route)
+			  const char *dns1,
+			  const char *dns2, int hidden, int route, int relay)
 {
 	struct saved_wifi items[SAVED_WIFI_MAX];
 	struct saved_wifi kept[SAVED_WIFI_MAX];
@@ -2098,17 +2103,16 @@ static void remember_wifi(const char *ssid, const char *psk,
 	memset(&next, 0, sizeof(next));
 	snprintf(next.ssid, sizeof(next.ssid), "%s", ssid);
 	snprintf(next.psk, sizeof(next.psk), "%s", psk);
-	snprintf(next.bssid, sizeof(next.bssid), "%s", bssid ? bssid : "");
 	snprintf(next.dns1, sizeof(next.dns1), "%s", dns1 ? dns1 : DEFAULT_DNS1);
 	snprintf(next.dns2, sizeof(next.dns2), "%s", dns2 ? dns2 : DEFAULT_DNS2);
 	next.hidden = hidden ? 1 : 0;
-	next.route = route ? 1 : 0;
+	next.relay = relay ? 1 : 0;
+	next.route = (route || relay) ? 1 : 0;
 
 	count = load_saved_wifi(items, SAVED_WIFI_MAX);
 	kept[out++] = next;
 	for (i = 0; i < count; i++) {
-		if (strcmp(items[i].ssid, next.ssid) == 0 &&
-		    strcmp(items[i].bssid, next.bssid) == 0)
+		if (strcmp(items[i].ssid, next.ssid) == 0)
 			continue;
 		if (out < SAVED_WIFI_MAX)
 			kept[out++] = items[i];
@@ -2117,7 +2121,7 @@ static void remember_wifi(const char *ssid, const char *psk,
 	save_saved_wifi(kept, out);
 }
 
-static int forget_wifi(const char *ssid, const char *bssid)
+static int forget_wifi(const char *ssid)
 {
 	struct saved_wifi items[SAVED_WIFI_MAX];
 	struct saved_wifi kept[SAVED_WIFI_MAX];
@@ -2127,8 +2131,7 @@ static int forget_wifi(const char *ssid, const char *bssid)
 
 	count = load_saved_wifi(items, SAVED_WIFI_MAX);
 	for (i = 0; i < count; i++) {
-		if (strcmp(items[i].ssid, ssid) == 0 &&
-		    strcmp(items[i].bssid, bssid ? bssid : "") == 0)
+		if (strcmp(items[i].ssid, ssid) == 0)
 			continue;
 		kept[out++] = items[i];
 	}
@@ -2575,7 +2578,7 @@ static int run_tool_quiet(const char *tool, char *const args[])
 {
 	const char *dirs[] = { "/sbin", "/bin", "/usr/sbin", "/usr/bin", NULL };
 	char path[64];
-	char *argv[8];
+	char *argv[32];
 	int i;
 	int j;
 	int n;
@@ -2587,7 +2590,7 @@ static int run_tool_quiet(const char *tool, char *const args[])
 		if (access(path, X_OK) != 0)
 			continue;
 		argv[0] = path;
-		for (j = 0; args[j] && j < 6; j++)
+		for (j = 0; args[j] && j < 30; j++)
 			argv[j + 1] = args[j];
 		argv[j + 1] = NULL;
 		return run_quiet(argv);
@@ -2596,17 +2599,655 @@ static int run_tool_quiet(const char *tool, char *const args[])
 	if (access("/bin/busybox", X_OK) == 0) {
 		argv[0] = "/bin/busybox";
 		argv[1] = (char *)tool;
-		for (j = 0; args[j] && j < 5; j++)
+		for (j = 0; args[j] && j < 29; j++)
 			argv[j + 2] = args[j];
 		argv[j + 2] = NULL;
 		return run_quiet(argv);
 	}
 
 	argv[0] = (char *)tool;
-	for (j = 0; args[j] && j < 6; j++)
+	for (j = 0; args[j] && j < 30; j++)
 		argv[j + 1] = args[j];
 	argv[j + 1] = NULL;
 	return run_quiet(argv);
+}
+
+static void strip_newline(char *s);
+
+static int command_output_contains(const char *cmd, const char *needle)
+{
+	FILE *fp;
+	char line[512];
+	int found = 0;
+
+	fp = popen(cmd, "r");
+	if (!fp)
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		if (strstr(line, needle)) {
+			found = 1;
+			break;
+		}
+	}
+	pclose(fp);
+	return found;
+}
+
+static int read_int_file(const char *path, int fallback)
+{
+	FILE *fp;
+	int value;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return fallback;
+	if (fscanf(fp, "%d", &value) != 1)
+		value = fallback;
+	fclose(fp);
+	return value;
+}
+
+static int write_int_file(const char *path, int value)
+{
+	FILE *fp;
+	int rc;
+
+	fp = fopen(path, "w");
+	if (!fp)
+		return -1;
+	rc = fprintf(fp, "%d\n", value) < 0 ? -1 : 0;
+	if (fclose(fp) != 0)
+		rc = -1;
+	return rc;
+}
+
+static int read_iface_ipv4_net(const char *iface, struct in_addr *ip,
+			       struct in_addr *mask)
+{
+	int fd;
+	struct ifreq ifr;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
+		close(fd);
+		return -1;
+	}
+	*ip = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFNETMASK, &ifr) < 0) {
+		close(fd);
+		return -1;
+	}
+	*mask = ((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr;
+	close(fd);
+	return 0;
+}
+
+static int mask_to_prefix(struct in_addr mask)
+{
+	uint32_t m = ntohl(mask.s_addr);
+	int prefix = 0;
+
+	while (m & 0x80000000U) {
+		prefix++;
+		m <<= 1;
+	}
+	return prefix;
+}
+
+static int iface_subnet_cidr(const char *iface, char *out, size_t outsz)
+{
+	struct in_addr ip;
+	struct in_addr mask;
+	struct in_addr net;
+	char addr[INET_ADDRSTRLEN];
+
+	if (read_iface_ipv4_net(iface, &ip, &mask) < 0)
+		return -1;
+	net.s_addr = ip.s_addr & mask.s_addr;
+	if (!inet_ntop(AF_INET, &net, addr, sizeof(addr)))
+		return -1;
+	snprintf(out, outsz, "%s/%d", addr, mask_to_prefix(mask));
+	return 0;
+}
+
+static int ifaces_same_subnet(const char *a, const char *b)
+{
+	struct in_addr ip_a;
+	struct in_addr mask_a;
+	struct in_addr ip_b;
+	struct in_addr mask_b;
+
+	if (read_iface_ipv4_net(a, &ip_a, &mask_a) < 0 ||
+	    read_iface_ipv4_net(b, &ip_b, &mask_b) < 0)
+		return 0;
+	return (ip_a.s_addr & mask_a.s_addr) ==
+	       (ip_b.s_addr & mask_b.s_addr) &&
+	       mask_a.s_addr == mask_b.s_addr;
+}
+
+static int iface_has_default_route(const char *iface)
+{
+	FILE *fp;
+	char line[256];
+	int found = 0;
+
+	fp = fopen("/proc/net/route", "r");
+	if (!fp)
+		return 0;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return 0;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		char ifn[IFNAMSIZ];
+		unsigned long dest;
+		unsigned long gw;
+		unsigned int flags;
+
+		if (sscanf(line, "%15s %lx %lx %x", ifn, &dest, &gw,
+			   &flags) != 4)
+			continue;
+		if (strcmp(ifn, iface) == 0 && dest == 0 && (flags & 0x2)) {
+			found = 1;
+			break;
+		}
+	}
+	fclose(fp);
+	return found;
+}
+
+static int subnet_conflicts_addr(uint32_t net_host)
+{
+	DIR *dir;
+	struct dirent *de;
+	uint32_t mask = 0xffffff00U;
+
+	dir = opendir("/sys/class/net");
+	if (!dir)
+		return 0;
+	while ((de = readdir(dir)) != NULL) {
+		struct in_addr ip;
+		struct in_addr ifmask;
+		uint32_t ifnet;
+
+		if (de->d_name[0] == '.')
+			continue;
+		if (read_iface_ipv4_net(de->d_name, &ip, &ifmask) < 0)
+			continue;
+		if (ntohl(ifmask.s_addr) != mask)
+			continue;
+		ifnet = ntohl(ip.s_addr) & mask;
+		if (ifnet == net_host) {
+			closedir(dir);
+			return 1;
+		}
+	}
+	closedir(dir);
+	return 0;
+}
+
+static int choose_lan_subnet(uint32_t *net_host_out)
+{
+	static const uint32_t candidates[] = {
+		0xc0a83200U, /* 192.168.50.0/24 */
+		0xc0a83300U, /* 192.168.51.0/24 */
+		0xc0a86400U, /* 192.168.100.0/24 */
+		0xc0a8c800U, /* 192.168.200.0/24 */
+		0xac100a00U, /* 172.16.10.0/24 */
+		0x0a2a0000U, /* 10.42.0.0/24 */
+		0x0a630000U  /* 10.99.0.0/24 */
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		if (!subnet_conflicts_addr(candidates[i])) {
+			*net_host_out = candidates[i];
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static void ipv4_from_host(uint32_t host, char *out, size_t outsz)
+{
+	struct in_addr a;
+
+	a.s_addr = htonl(host);
+	inet_ntop(AF_INET, &a, out, outsz);
+}
+
+static int write_udhcpd_conf(uint32_t net_host)
+{
+	FILE *fp;
+	char ip_start[INET_ADDRSTRLEN];
+	char ip_end[INET_ADDRSTRLEN];
+	char ip_router[INET_ADDRSTRLEN];
+
+	ipv4_from_host(net_host + 100, ip_start, sizeof(ip_start));
+	ipv4_from_host(net_host + 200, ip_end, sizeof(ip_end));
+	ipv4_from_host(net_host + 1, ip_router, sizeof(ip_router));
+	if (mkdir_parent(DEFAULT_UDHCPD_CONF) < 0)
+		return -1;
+	fp = fopen(DEFAULT_UDHCPD_CONF, "w");
+	if (!fp)
+		return -1;
+	fprintf(fp,
+		"start %s\n"
+		"end %s\n"
+		"interface br0\n"
+		"option subnet 255.255.255.0\n"
+		"option dns %s\n"
+		"option router %s\n"
+		"option lease 86400\n"
+		"pidfile /etc_rw/udhcpd.pid\n"
+		"lease_file /etc_rw/udhcpd.leases\n",
+		ip_start, ip_end, ip_router, ip_router);
+	if (fclose(fp) != 0)
+		return -1;
+	unlink(DEFAULT_UDHCPD_LEASES);
+	return 0;
+}
+
+static int start_udhcpd_process(void)
+{
+	const char *dirs[] = { "/sbin", "/bin", "/usr/sbin", "/usr/bin", NULL };
+	char path[64];
+	const char *exe = NULL;
+	pid_t pid;
+	int i;
+
+	for (i = 0; dirs[i]; i++) {
+		if (snprintf(path, sizeof(path), "%s/udhcpd", dirs[i]) < 0)
+			continue;
+		if (access(path, X_OK) == 0) {
+			exe = path;
+			break;
+		}
+	}
+	if (!exe && access("/bin/busybox", X_OK) == 0)
+		exe = "/bin/busybox";
+	if (!exe) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		int fd;
+
+		setsid();
+		fd = open("/tmp/wpa_mini_udhcpd.out",
+			  O_WRONLY | O_CREAT | O_APPEND, 0600);
+		if (fd < 0)
+			fd = open("/dev/null", O_RDWR);
+		if (fd >= 0) {
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			if (fd > STDERR_FILENO)
+				close(fd);
+		}
+		fd = open("/dev/null", O_RDONLY);
+		if (fd >= 0) {
+			dup2(fd, STDIN_FILENO);
+			if (fd > STDERR_FILENO)
+				close(fd);
+		}
+		if (strcmp(exe, "/bin/busybox") == 0)
+			execl(exe, exe, "udhcpd", "-f", DEFAULT_UDHCPD_CONF,
+			      (char *)NULL);
+		else
+			execl(exe, exe, "-f", DEFAULT_UDHCPD_CONF,
+			      (char *)NULL);
+		_exit(127);
+	}
+	return 0;
+}
+
+static int restart_udhcpd(void)
+{
+	system("for p in $(ps | grep '[u]dhcpd -f /etc_rw/udhcpd.conf' | awk '{print $1}'); do kill $p 2>/dev/null; done");
+	return start_udhcpd_process();
+}
+
+static int adjust_lan_subnet(const struct app_config *cfg, uint32_t net_host,
+			     char *new_subnet, size_t new_subnet_sz)
+{
+	char ip_router[INET_ADDRSTRLEN];
+	char ip_bcast[INET_ADDRSTRLEN];
+	char *ifconfig_args[] = { "br0", ip_router, "netmask", "255.255.255.0",
+				  "broadcast", ip_bcast, "up", NULL };
+	FILE *fp;
+
+	ipv4_from_host(net_host + 1, ip_router, sizeof(ip_router));
+	ipv4_from_host(net_host + 255, ip_bcast, sizeof(ip_bcast));
+	log_msg(cfg, "lan adjust requested br0=%s/24", ip_router);
+
+	stop_relay(cfg);
+	if (write_udhcpd_conf(net_host) < 0) {
+		log_msg(cfg, "lan adjust udhcpd conf failed errno=%d", errno);
+		return -1;
+	}
+	if (run_tool_quiet("ifconfig", ifconfig_args) < 0) {
+		log_msg(cfg, "lan adjust ifconfig failed errno=%d", errno);
+		return -1;
+	}
+	if (restart_udhcpd() < 0) {
+		log_msg(cfg, "lan adjust udhcpd restart failed errno=%d", errno);
+		return -1;
+	}
+	signal_dnsmasq_reload(cfg);
+	fp = fopen(DEFAULT_LAN_ADJUST_STATE, "w");
+	if (fp) {
+		fprintf(fp, "br0=%s\nnet=%u\n", ip_router, net_host);
+		fclose(fp);
+	}
+	snprintf(new_subnet, new_subnet_sz, "%s/24", ip_router);
+	return 0;
+}
+
+static int iptables_rule(char *const args[])
+{
+	return run_tool_quiet("iptables", args);
+}
+
+static int relay_rule_exists(const char *chain, const char *src,
+			     const char *in_if, const char *out_if,
+			     int nat)
+{
+	char needle[256];
+
+	if (nat) {
+		snprintf(needle, sizeof(needle),
+			 "-A %s -s %s -o %s -j MASQUERADE",
+			 chain, src, out_if);
+		return command_output_contains("iptables -t nat -S 2>/dev/null",
+					       needle);
+	}
+	if (src && *src)
+		snprintf(needle, sizeof(needle),
+			 "-A %s -s %s -i %s -o %s -j ACCEPT",
+			 chain, src, in_if, out_if);
+	else
+		snprintf(needle, sizeof(needle),
+			 "-A %s -i %s -o %s -j ACCEPT", chain, in_if, out_if);
+	return command_output_contains("iptables -S 2>/dev/null", needle);
+}
+
+static int add_relay_rule(const char *chain, const char *src,
+			  const char *in_if, const char *out_if, int nat)
+{
+	char *nat_args[] = { "-t", "nat", "-A", (char *)chain,
+			     "-s", (char *)src, "-o", (char *)out_if,
+			     "-j", "MASQUERADE", NULL };
+	char *fwd_src_args[] = { "-A", (char *)chain, "-s", (char *)src,
+				 "-i", (char *)in_if, "-o", (char *)out_if,
+				 "-j", "ACCEPT", NULL };
+	char *fwd_args[] = { "-A", (char *)chain, "-i", (char *)in_if,
+			     "-o", (char *)out_if, "-j", "ACCEPT", NULL };
+
+	if (relay_rule_exists(chain, src, in_if, out_if, nat))
+		return 0;
+	if (nat)
+		return iptables_rule(nat_args);
+	return iptables_rule(src && *src ? fwd_src_args : fwd_args);
+}
+
+static void delete_relay_rule(const char *chain, const char *src,
+			      const char *in_if, const char *out_if, int nat)
+{
+	char *nat_args[] = { "-t", "nat", "-D", (char *)chain,
+			     "-s", (char *)src, "-o", (char *)out_if,
+			     "-j", "MASQUERADE", NULL };
+	char *fwd_src_args[] = { "-D", (char *)chain, "-s", (char *)src,
+				 "-i", (char *)in_if, "-o", (char *)out_if,
+				 "-j", "ACCEPT", NULL };
+	char *fwd_args[] = { "-D", (char *)chain, "-i", (char *)in_if,
+			     "-o", (char *)out_if, "-j", "ACCEPT", NULL };
+	int i;
+
+	for (i = 0; i < 8 && relay_rule_exists(chain, src, in_if, out_if, nat);
+	     i++) {
+		if (iptables_rule(nat ? nat_args :
+				  (src && *src ? fwd_src_args : fwd_args)) < 0)
+			break;
+	}
+}
+
+static void signal_dnsmasq_reload(const struct app_config *cfg)
+{
+	FILE *fp;
+	char line[256];
+
+	fp = popen("ps | grep '[d]nsmasq' 2>/dev/null", "r");
+	if (!fp)
+		return;
+	while (fgets(line, sizeof(line), fp)) {
+		long pid;
+		char *end;
+
+		errno = 0;
+		pid = strtol(line, &end, 10);
+		if (pid > 1 && !errno) {
+			log_msg(cfg, "relay dnsmasq hup pid=%ld", pid);
+			kill((pid_t)pid, SIGHUP);
+		}
+	}
+	pclose(fp);
+}
+
+static void sync_system_dns_for_relay(const struct app_config *cfg,
+				      const char *dns1, const char *dns2)
+{
+	FILE *fp;
+	const char *use_dns1 = (dns1 && *dns1) ? dns1 : DEFAULT_DNS1;
+	const char *use_dns2 = (dns2 && *dns2) ? dns2 : DEFAULT_DNS2;
+
+	if (strcmp(cfg->dns_path, SYSTEM_DNS_PATH) == 0 ||
+	    strcmp(cfg->dns_path, "/etc/resolv.conf") == 0)
+		goto reload;
+
+	if (mkdir_parent(SYSTEM_DNS_PATH) < 0)
+		return;
+	fp = fopen(SYSTEM_DNS_PATH, "w");
+	if (!fp) {
+		log_msg(cfg, "relay system dns write failed errno=%d", errno);
+		return;
+	}
+	if (use_dns1[0])
+		fprintf(fp, "nameserver %s\n", use_dns1);
+	if (use_dns2[0])
+		fprintf(fp, "nameserver %s\n", use_dns2);
+	if (fclose(fp) != 0)
+		log_msg(cfg, "relay system dns close failed errno=%d", errno);
+
+reload:
+	signal_dnsmasq_reload(cfg);
+}
+
+static void relay_write_state(const char *lan_if, const char *subnet,
+			      const char *wan_if, int old_forward,
+			      int nat_rule, int fwd_rule)
+{
+	FILE *fp;
+
+	if (mkdir_parent(DEFAULT_RELAY_STATE) < 0)
+		return;
+	fp = fopen(DEFAULT_RELAY_STATE, "w");
+	if (!fp)
+		return;
+	fprintf(fp, "lan=%s\nsubnet=%s\nwan=%s\nold_forward=%d\nnat=%d\nfwd=%d\n",
+		lan_if, subnet, wan_if, old_forward, nat_rule, fwd_rule);
+	fclose(fp);
+}
+
+static int relay_read_state(char *lan_if, size_t lan_sz,
+			    char *subnet, size_t subnet_sz,
+			    char *wan_if, size_t wan_sz,
+			    int *old_forward, int *nat_rule, int *fwd_rule)
+{
+	FILE *fp;
+	char line[256];
+
+	if (lan_sz)
+		lan_if[0] = '\0';
+	if (subnet_sz)
+		subnet[0] = '\0';
+	if (wan_sz)
+		wan_if[0] = '\0';
+	if (old_forward)
+		*old_forward = -1;
+	if (nat_rule)
+		*nat_rule = 0;
+	if (fwd_rule)
+		*fwd_rule = 0;
+
+	fp = fopen(DEFAULT_RELAY_STATE, "r");
+	if (!fp)
+		return -1;
+	while (fgets(line, sizeof(line), fp)) {
+		strip_newline(line);
+		if (strncmp(line, "lan=", 4) == 0)
+			snprintf(lan_if, lan_sz, "%s", line + 4);
+		else if (strncmp(line, "subnet=", 7) == 0)
+			snprintf(subnet, subnet_sz, "%s", line + 7);
+		else if (strncmp(line, "wan=", 4) == 0)
+			snprintf(wan_if, wan_sz, "%s", line + 4);
+		else if (strncmp(line, "old_forward=", 12) == 0 && old_forward)
+			*old_forward = atoi(line + 12);
+		else if (strncmp(line, "nat=", 4) == 0 && nat_rule)
+			*nat_rule = atoi(line + 4);
+		else if (strncmp(line, "fwd=", 4) == 0 && fwd_rule)
+			*fwd_rule = atoi(line + 4);
+	}
+	fclose(fp);
+	return lan_if[0] && subnet[0] && wan_if[0] ? 0 : -1;
+}
+
+static void stop_relay(const struct app_config *cfg)
+{
+	char lan_if[IFNAMSIZ];
+	char wan_if[IFNAMSIZ];
+	char subnet[64];
+	int old_forward;
+	int nat_rule;
+	int fwd_rule;
+
+	if (relay_read_state(lan_if, sizeof(lan_if), subnet, sizeof(subnet),
+			     wan_if, sizeof(wan_if), &old_forward, &nat_rule,
+			     &fwd_rule) < 0)
+		return;
+	log_msg(cfg, "relay stop lan=%s subnet=%s wan=%s old_forward=%d nat=%d fwd=%d",
+		lan_if, subnet, wan_if, old_forward, nat_rule, fwd_rule);
+	if (nat_rule)
+		delete_relay_rule("POSTROUTING", subnet, lan_if, wan_if, 1);
+	if (fwd_rule) {
+		delete_relay_rule("FORWARD", subnet, lan_if, wan_if, 0);
+		delete_relay_rule("FORWARD", "", wan_if, lan_if, 0);
+	}
+	if (old_forward == 0 || old_forward == 1)
+		write_int_file("/proc/sys/net/ipv4/ip_forward", old_forward);
+	unlink(DEFAULT_RELAY_STATE);
+}
+
+static int start_relay(const struct app_config *cfg, const char *dns1,
+		       const char *dns2)
+{
+	const char *lan_if = "br0";
+	char subnet[64];
+	int old_forward;
+	int nat_ok = 0;
+	int fwd_ok = 0;
+
+	if (ifaces_same_subnet(cfg->iface, lan_if)) {
+		log_msg(cfg, "relay start failed: %s and %s share subnet",
+			cfg->iface, lan_if);
+		errno = EINVAL;
+		return -1;
+	}
+	if (!iface_has_default_route(cfg->iface)) {
+		log_msg(cfg, "relay start failed: no default route on %s",
+			cfg->iface);
+		errno = ENETUNREACH;
+		return -1;
+	}
+	if (iface_subnet_cidr(lan_if, subnet, sizeof(subnet)) < 0) {
+		log_msg(cfg, "relay start failed: no subnet for %s errno=%d",
+			lan_if, errno);
+		return -1;
+	}
+
+	stop_relay(cfg);
+	old_forward = read_int_file("/proc/sys/net/ipv4/ip_forward", 0);
+	if (write_int_file("/proc/sys/net/ipv4/ip_forward", 1) < 0) {
+		log_msg(cfg, "relay ip_forward enable failed errno=%d", errno);
+		return -1;
+	}
+
+	if (add_relay_rule("POSTROUTING", subnet, lan_if, cfg->iface, 1) < 0) {
+		log_msg(cfg, "relay nat rule failed subnet=%s wan=%s errno=%d",
+			subnet, cfg->iface, errno);
+		write_int_file("/proc/sys/net/ipv4/ip_forward", old_forward);
+		return -1;
+	}
+	nat_ok = 1;
+	if (add_relay_rule("FORWARD", subnet, lan_if, cfg->iface, 0) == 0 &&
+	    add_relay_rule("FORWARD", "", cfg->iface, lan_if, 0) == 0) {
+		fwd_ok = 1;
+	} else {
+		log_msg(cfg, "relay forward rule warning errno=%d", errno);
+		delete_relay_rule("FORWARD", subnet, lan_if, cfg->iface, 0);
+		delete_relay_rule("FORWARD", "", cfg->iface, lan_if, 0);
+	}
+
+	relay_write_state(lan_if, subnet, cfg->iface, old_forward, nat_ok,
+			  fwd_ok);
+	sync_system_dns_for_relay(cfg, dns1, dns2);
+	log_msg(cfg, "relay started lan=%s subnet=%s wan=%s old_forward=%d fwd=%d",
+		lan_if, subnet, cfg->iface, old_forward, fwd_ok);
+	return 0;
+}
+
+static void get_relay_status(const struct app_config *cfg,
+			     struct runtime_status *st)
+{
+	char lan_if[IFNAMSIZ];
+	char wan_if[IFNAMSIZ];
+	char subnet[64];
+	int old_forward;
+	int nat_rule;
+	int fwd_rule;
+
+	st->relay_ip_forward =
+		read_int_file("/proc/sys/net/ipv4/ip_forward", 0);
+	if (relay_read_state(lan_if, sizeof(lan_if), subnet, sizeof(subnet),
+			     wan_if, sizeof(wan_if), &old_forward, &nat_rule,
+			     &fwd_rule) < 0)
+		return;
+	snprintf(st->relay_lan_iface, sizeof(st->relay_lan_iface), "%s",
+		 lan_if);
+	snprintf(st->relay_lan_subnet, sizeof(st->relay_lan_subnet), "%s",
+		 subnet);
+	snprintf(st->relay_wan_iface, sizeof(st->relay_wan_iface), "%s",
+		 wan_if);
+	st->relay_nat_rule =
+		relay_rule_exists("POSTROUTING", subnet, lan_if, wan_if, 1);
+	st->relay_enabled = st->engine_running &&
+			    strcmp(st->wpa_state, "COMPLETED") == 0 &&
+			    st->ip[0] &&
+			    st->relay_ip_forward == 1 && st->relay_nat_rule &&
+			    !st->sta_lan_conflict && st->default_route_ready;
+	(void)cfg;
+	(void)old_forward;
+	(void)nat_rule;
+	(void)fwd_rule;
 }
 
 static void deconfigure_iface(const struct app_config *cfg)
@@ -2678,6 +3319,38 @@ static void read_dns_file(const char *path, char *out, size_t outsz)
 		count++;
 		if (count >= 3)
 			break;
+	}
+	fclose(fp);
+}
+
+static void read_dns_pair(const char *path, char *dns1, size_t dns1sz,
+			  char *dns2, size_t dns2sz)
+{
+	FILE *fp;
+	char line[256];
+	int count = 0;
+
+	if (dns1sz)
+		dns1[0] = '\0';
+	if (dns2sz)
+		dns2[0] = '\0';
+	fp = fopen(path, "r");
+	if (!fp)
+		return;
+	while (fgets(line, sizeof(line), fp)) {
+		char dns[64];
+
+		if (sscanf(line, "nameserver %63s", dns) != 1)
+			continue;
+		if (!valid_ipv4_or_empty(dns))
+			continue;
+		if (count == 0)
+			snprintf(dns1, dns1sz, "%s", dns);
+		else if (count == 1) {
+			snprintf(dns2, dns2sz, "%s", dns);
+			break;
+		}
+		count++;
 	}
 	fclose(fp);
 }
@@ -3204,6 +3877,20 @@ static void get_runtime_status(const struct app_config *cfg,
 	read_iface_ipv4(cfg->iface, st->ip, sizeof(st->ip));
 	read_gateway(cfg->iface, st->gateway, sizeof(st->gateway));
 	read_dns_file(cfg->dns_path, st->dns, sizeof(st->dns));
+	if (iface_subnet_cidr(cfg->iface, st->sta_subnet,
+			      sizeof(st->sta_subnet)) < 0)
+		st->sta_subnet[0] = '\0';
+	if (iface_subnet_cidr("br0", st->lan_subnet,
+			      sizeof(st->lan_subnet)) < 0)
+		st->lan_subnet[0] = '\0';
+	st->default_route_ready = iface_has_default_route(cfg->iface);
+	st->sta_lan_conflict = ifaces_same_subnet(cfg->iface, "br0");
+	get_relay_status(cfg, st);
+}
+
+static int runtime_is_connected(const struct runtime_status *st)
+{
+	return strcmp(st->wpa_state, "COMPLETED") == 0 && st->ip[0];
 }
 
 static int wait_wpa_completed(const struct app_config *cfg, int timeout_ms)
@@ -3424,9 +4111,8 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 		html_escape(esc_ssid, sizeof(esc_ssid), decoded_ssid);
 		buf_append(out, outsz,
 			   "<tr><td class=\"ssidcell\">%s</td><td>%s dBm</td><td>%s</td><td>%s</td>"
-			   "<td><button class=\"pick\" type=\"button\" data-ssid=\"%s\" data-bssid=\"%s\" onclick=\"pickNet(this)\">选择</button></td></tr>",
-			   esc_ssid, esc_signal, esc_flags, esc_bssid, esc_ssid,
-			   esc_bssid);
+			   "<td><button class=\"pick\" type=\"button\" data-ssid=\"%s\" onclick=\"pickNet(this)\">选择</button></td></tr>",
+			   esc_ssid, esc_signal, esc_flags, esc_bssid, esc_ssid);
 		rows++;
 	}
 
@@ -3455,26 +4141,24 @@ static void build_saved_html(char *out, size_t outsz)
 		buf_append(out, outsz, "<div class=\"hint\">暂无保存的网络，连接成功后会自动保存。</div>");
 	} else {
 		for (i = 0; i < count; i++) {
-			char esc_ssid[256], esc_bssid[128], esc_dns1[128], esc_dns2[128];
+			char esc_ssid[256], esc_dns1[128], esc_dns2[128];
 
 			html_escape(esc_ssid, sizeof(esc_ssid), items[i].ssid);
-			html_escape(esc_bssid, sizeof(esc_bssid), items[i].bssid);
 			html_escape(esc_dns1, sizeof(esc_dns1), items[i].dns1);
 			html_escape(esc_dns2, sizeof(esc_dns2), items[i].dns2);
 			buf_append(out, outsz,
 				   "<div class=\"saved\"><div><div class=\"v\">%s</div>"
-				   "<div class=\"hint\">BSSID %s · DNS %s / %s%s%s</div></div>"
+				   "<div class=\"hint\">DNS %s / %s%s%s</div></div>"
 				   "<div class=\"savedact\">"
 				   "<form method=\"post\" action=\"/connect_saved\"><input type=\"hidden\" name=\"idx\" value=\"%d\"><button type=\"submit\">连接</button></form>"
-				   "<form method=\"post\" action=\"/forget\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><input type=\"hidden\" name=\"bssid\" value=\"%s\"><button class=\"alt\" type=\"submit\">删除</button></form>"
+				   "<form method=\"post\" action=\"/forget\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><button class=\"alt\" type=\"submit\">删除</button></form>"
 				   "</div></div>",
 				   esc_ssid,
-				   esc_bssid[0] ? esc_bssid : "-",
 				   esc_dns1[0] ? esc_dns1 : DEFAULT_DNS1,
 				   esc_dns2[0] ? esc_dns2 : DEFAULT_DNS2,
 				   items[i].hidden ? " · 隐藏" : "",
-				   items[i].route ? " · 默认路由" : "",
-				   i, esc_ssid, esc_bssid);
+				   items[i].relay ? " · 中继" : "",
+				   i, esc_ssid);
 		}
 	}
 	buf_append(out, outsz, "</div></section>");
@@ -3520,28 +4204,22 @@ static void build_autostart_html(char *out, size_t outsz)
 		   st.hook_ready ? "已安装" : "未安装");
 }
 
-static void build_system_html(const struct app_config *cfg, char *out,
-			      size_t outsz)
+static void append_system_overview_html(const struct system_snapshot *snap,
+					char *out, size_t outsz)
 {
-	struct system_snapshot snap;
 	char esc[512], esc2[512], esc3[512], esc4[512], esc5[512];
-	int i;
 
-	if (outsz)
-		out[0] = '\0';
-	collect_system_snapshot(cfg, &snap);
-
-	html_escape(esc, sizeof(esc), snap.hostname[0] ? snap.hostname : "-");
-	html_escape(esc2, sizeof(esc2), snap.uptime[0] ? snap.uptime : "-");
-	html_escape(esc3, sizeof(esc3), snap.loadavg[0] ? snap.loadavg : "-");
-	html_escape(esc4, sizeof(esc4), snap.default_iface[0] ?
-		    snap.default_iface : "-");
-	html_escape(esc5, sizeof(esc5), snap.mem[0] ? snap.mem : "-");
+	html_escape(esc, sizeof(esc), snap->hostname[0] ? snap->hostname : "-");
+	html_escape(esc2, sizeof(esc2), snap->uptime[0] ? snap->uptime : "-");
+	html_escape(esc3, sizeof(esc3), snap->loadavg[0] ? snap->loadavg : "-");
+	html_escape(esc4, sizeof(esc4), snap->default_iface[0] ?
+		    snap->default_iface : "-");
+	html_escape(esc5, sizeof(esc5), snap->mem[0] ? snap->mem : "-");
 	buf_append(out, outsz,
 		   "<section class=\"panel\"><div class=\"formtop\"><div>"
-		   "<div class=\"title\">系统状态</div>"
-		   "<div class=\"hint\">只读信息，来自 /proc、ifconfig、route、netstat</div>"
-		   "</div><form method=\"get\" action=\"/\"><button class=\"alt\" type=\"submit\">刷新状态</button></form>"
+		   "<div class=\"title\">系统概览</div>"
+		   "<div class=\"hint\">只读信息，来自 /proc 和系统配置文件</div>"
+		   "</div><a class=\"tinylink\" href=\"/system\">文本快照</a>"
 		   "</div><div class=\"pad\"><div class=\"grid\">"
 		   "<div class=\"kv\"><div class=\"k\">主机名</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">运行时间</div><div class=\"v\">%s</div></div>"
@@ -3549,31 +4227,40 @@ static void build_system_html(const struct app_config *cfg, char *out,
 		   "<div class=\"kv\"><div class=\"k\">默认路由接口</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">内存</div><div class=\"v\">%s</div></div>",
 		   esc, esc2, esc3, esc4, esc5);
-	html_escape(esc, sizeof(esc), snap.dns_user[0] ? snap.dns_user : "-");
-	html_escape(esc2, sizeof(esc2), snap.dns_system[0] ?
-		    snap.dns_system : "-");
+	html_escape(esc, sizeof(esc), snap->dns_user[0] ? snap->dns_user : "-");
+	html_escape(esc2, sizeof(esc2), snap->dns_system[0] ?
+		    snap->dns_system : "-");
 	buf_append(out, outsz,
 		   "<div class=\"kv\"><div class=\"k\">wpa_mini DNS</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">系统 DNS</div><div class=\"v\">%s</div></div>",
 		   esc, esc2);
-	html_escape(esc, sizeof(esc), snap.kernel[0] ? snap.kernel : "-");
+	html_escape(esc, sizeof(esc), snap->kernel[0] ? snap->kernel : "-");
 	buf_append(out, outsz,
-		   "<div class=\"kv\"><div class=\"k\">内核</div><div class=\"v smallv\">%s</div></div>"
+		   "<div class=\"kv wide\"><div class=\"k\">内核</div><div class=\"v smallv\">%s</div></div>"
 		   "</div></div></section>",
 		   esc);
+}
+
+static void append_interfaces_html(const struct system_snapshot *snap,
+				   char *out, size_t outsz)
+{
+	char esc[512], esc2[512], esc3[512], esc4[512], esc5[512];
+	int i;
 
 	buf_append(out, outsz,
 		   "<section class=\"panel\"><div class=\"formtop\"><div>"
 		   "<div class=\"title\">网络接口</div>"
-		   "<div class=\"hint\">列出目标系统发现的全部接口，WAN 口会自动标记</div>"
-		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
-		   "<th>接口</th><th>类型</th><th>状态</th><th>IPv4</th><th>MAC</th><th>Bridge</th><th>RX/TX</th><th>错误/丢包</th>"
+		   "<div class=\"hint\">列出目标系统发现的全部接口，STA 和默认路由会自动标记</div>"
+		   "</div><a class=\"tinylink\" href=\"/interfaces\">刷新</a>"
+		   "</div><div class=\"tablewrap\"><table><thead><tr>"
+		   "<th>接口</th><th>类型</th><th>状态</th><th>IPv4</th><th>IPv6</th><th>MAC</th><th>MTU</th><th>Bridge</th><th>RX/TX</th><th>错误/丢包</th>"
 		   "</tr></thead><tbody>");
-	for (i = 0; i < snap.iface_count; i++) {
-		struct sys_iface *it = &snap.ifaces[i];
+	for (i = 0; i < snap->iface_count; i++) {
+		const struct sys_iface *it = &snap->ifaces[i];
 		char rowcls[64] = "";
 		char rx_tx[128];
 		char errs[128];
+		char mtu[32];
 
 		if (it->is_sta)
 			snprintf(rowcls, sizeof(rowcls), " class=\"focusrow\"");
@@ -3583,52 +4270,64 @@ static void build_system_html(const struct app_config *cfg, char *out,
 			 it->rx_bytes, it->tx_bytes);
 		snprintf(errs, sizeof(errs), "rx %llu/%llu · tx %llu/%llu",
 			 it->rx_errs, it->rx_drop, it->tx_errs, it->tx_drop);
+		snprintf(mtu, sizeof(mtu), "%lu", it->mtu);
 		html_escape(esc, sizeof(esc), it->name);
 		html_escape(esc2, sizeof(esc2), it->kind[0] ? it->kind : "-");
 		html_escape(esc3, sizeof(esc3), it->state[0] ? it->state : "-");
 		html_escape(esc4, sizeof(esc4), it->ipv4[0] ? it->ipv4 : "-");
-		html_escape(esc5, sizeof(esc5), it->mac[0] ? it->mac : "-");
+		html_escape(esc5, sizeof(esc5), it->ipv6[0] ? it->ipv6 : "-");
 		buf_append(out, outsz,
 			   "<tr%s><td class=\"ssidcell\">%s%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>",
-			   rowcls, esc, it->is_sta ? " <span class=\"tag\">STA</span>" : "",
+			   rowcls, esc,
+			   it->is_sta ? " <span class=\"tag\">STA</span>" : "",
 			   it->is_default ? " <span class=\"tag\">默认</span>" : "",
 			   esc2, esc3, esc4, esc5);
-		html_escape(esc, sizeof(esc), it->bridge[0] ? it->bridge : "-");
-		html_escape(esc2, sizeof(esc2), rx_tx);
-		html_escape(esc3, sizeof(esc3), errs);
-		buf_append(out, outsz, "<td>%s</td><td>%s</td><td>%s</td></tr>",
-			   esc, esc2, esc3);
+		html_escape(esc, sizeof(esc), it->mac[0] ? it->mac : "-");
+		html_escape(esc2, sizeof(esc2), mtu);
+		html_escape(esc3, sizeof(esc3), it->bridge[0] ? it->bridge : "-");
+		html_escape(esc4, sizeof(esc4), rx_tx);
+		html_escape(esc5, sizeof(esc5), errs);
+		buf_append(out, outsz,
+			   "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+			   esc, esc2, esc3, esc4, esc5);
 	}
-	if (!snap.iface_count)
-		buf_append(out, outsz, "<tr><td colspan=\"8\">未读取到接口</td></tr>");
+	if (!snap->iface_count)
+		buf_append(out, outsz, "<tr><td colspan=\"10\">未读取到接口</td></tr>");
 	buf_append(out, outsz, "</tbody></table></div></section>");
+}
+
+static void append_routes_arp_html(const struct system_snapshot *snap,
+				   char *out, size_t outsz)
+{
+	char esc[512], esc2[512], esc3[512], esc4[512];
+	int i;
 
 	buf_append(out, outsz,
 		   "<section class=\"panel\"><div class=\"formtop\"><div>"
 		   "<div class=\"title\">路由与邻居</div>"
-		   "<div class=\"hint\">IPv4 路由和 ARP 表</div>"
+		   "<div class=\"hint\">IPv4 路由表和 ARP 表</div>"
 		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
-		   "<th>目标</th><th>网关</th><th>掩码</th><th>接口</th><th>标记</th>"
+		   "<th>目标</th><th>网关</th><th>掩码</th><th>接口</th><th>Metric</th><th>标记</th>"
 		   "</tr></thead><tbody>");
-	for (i = 0; i < snap.route_count; i++) {
-		struct sys_route *rt = &snap.routes[i];
+	for (i = 0; i < snap->route_count; i++) {
+		const struct sys_route *rt = &snap->routes[i];
 		html_escape(esc, sizeof(esc), rt->dest);
 		html_escape(esc2, sizeof(esc2), rt->gateway);
 		html_escape(esc3, sizeof(esc3), rt->mask);
 		html_escape(esc4, sizeof(esc4), rt->iface);
 		buf_append(out, outsz,
-			   "<tr%s><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>0x%x%s</td></tr>",
+			   "<tr%s><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%u</td><td>0x%x%s</td></tr>",
 			   rt->is_default ? " class=\"defrow\"" : "",
-			   esc, esc2, esc3, esc4, rt->flags,
+			   esc, esc2, esc3, esc4, rt->metric, rt->flags,
 			   rt->is_default ? " 默认" : "");
 	}
-	if (!snap.route_count)
-		buf_append(out, outsz, "<tr><td colspan=\"5\">无 IPv4 路由</td></tr>");
+	if (!snap->route_count)
+		buf_append(out, outsz, "<tr><td colspan=\"6\">无 IPv4 路由</td></tr>");
 	buf_append(out, outsz, "</tbody></table></div><div class=\"tablewrap\"><table><thead><tr>"
 		   "<th>IP</th><th>MAC</th><th>接口</th><th>标记</th>"
 		   "</tr></thead><tbody>");
-	for (i = 0; i < snap.arp_count; i++) {
-		struct sys_arp *arp = &snap.arps[i];
+	for (i = 0; i < snap->arp_count; i++) {
+		const struct sys_arp *arp = &snap->arps[i];
 		html_escape(esc, sizeof(esc), arp->ip);
 		html_escape(esc2, sizeof(esc2), arp->mac);
 		html_escape(esc3, sizeof(esc3), arp->iface);
@@ -3637,19 +4336,26 @@ static void build_system_html(const struct app_config *cfg, char *out,
 			   "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
 			   esc, esc2, esc3, esc4);
 	}
-	if (!snap.arp_count)
+	if (!snap->arp_count)
 		buf_append(out, outsz, "<tr><td colspan=\"4\">无 ARP 记录</td></tr>");
 	buf_append(out, outsz, "</tbody></table></div></section>");
+}
+
+static void append_services_mounts_html(const struct system_snapshot *snap,
+					char *out, size_t outsz)
+{
+	char esc[512], esc2[512], esc3[512], esc4[512];
+	int i;
 
 	buf_append(out, outsz,
 		   "<section class=\"panel\"><div class=\"formtop\"><div>"
-		   "<div class=\"title\">监听服务与挂载</div>"
-		   "<div class=\"hint\">当前开放端口和关键分区</div>"
+		   "<div class=\"title\">监听服务</div>"
+		   "<div class=\"hint\">当前开放端口，只做读取展示</div>"
 		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
 		   "<th>协议</th><th>监听地址</th><th>状态</th><th>进程</th>"
 		   "</tr></thead><tbody>");
-	for (i = 0; i < snap.listen_count; i++) {
-		struct sys_listen *ln = &snap.listens[i];
+	for (i = 0; i < snap->listen_count; i++) {
+		const struct sys_listen *ln = &snap->listens[i];
 		html_escape(esc, sizeof(esc), ln->proto);
 		html_escape(esc2, sizeof(esc2), ln->local);
 		html_escape(esc3, sizeof(esc3), ln->state);
@@ -3658,13 +4364,17 @@ static void build_system_html(const struct app_config *cfg, char *out,
 			   "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
 			   esc, esc2, esc3, esc4);
 	}
-	if (!snap.listen_count)
+	if (!snap->listen_count)
 		buf_append(out, outsz, "<tr><td colspan=\"4\">未读取到监听端口</td></tr>");
-	buf_append(out, outsz, "</tbody></table></div><div class=\"tablewrap\"><table><thead><tr>"
+	buf_append(out, outsz, "</tbody></table></div></section>"
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">挂载分区</div>"
+		   "<div class=\"hint\">关键分区容量和挂载选项</div>"
+		   "</div></div><div class=\"tablewrap\"><table><thead><tr>"
 		   "<th>挂载点</th><th>类型</th><th>可用/总量</th><th>选项</th>"
 		   "</tr></thead><tbody>");
-	for (i = 0; i < snap.fs_count; i++) {
-		struct sys_fs *fs = &snap.filesystems[i];
+	for (i = 0; i < snap->fs_count; i++) {
+		const struct sys_fs *fs = &snap->filesystems[i];
 		char usage[96];
 		snprintf(usage, sizeof(usage), "%luK / %luK",
 			 fs->avail_kb, fs->total_kb);
@@ -3676,7 +4386,33 @@ static void build_system_html(const struct app_config *cfg, char *out,
 			   "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
 			   esc, esc2, esc3, esc4);
 	}
+	if (!snap->fs_count)
+		buf_append(out, outsz, "<tr><td colspan=\"4\">未读取到挂载信息</td></tr>");
 	buf_append(out, outsz, "</tbody></table></div></section>");
+}
+
+static void build_interfaces_html(const struct app_config *cfg, char *out,
+				  size_t outsz)
+{
+	struct system_snapshot snap;
+
+	if (outsz)
+		out[0] = '\0';
+	collect_system_snapshot(cfg, &snap);
+	append_interfaces_html(&snap, out, outsz);
+	append_routes_arp_html(&snap, out, outsz);
+}
+
+static void build_system_page_html(const struct app_config *cfg, char *out,
+				   size_t outsz)
+{
+	struct system_snapshot snap;
+
+	if (outsz)
+		out[0] = '\0';
+	collect_system_snapshot(cfg, &snap);
+	append_system_overview_html(&snap, out, outsz);
+	append_services_mounts_html(&snap, out, outsz);
 }
 
 static void build_system_text(const struct app_config *cfg, char *out,
@@ -3740,146 +4476,316 @@ static void build_system_text(const struct app_config *cfg, char *out,
 	}
 }
 
+enum web_page {
+	WEB_PAGE_HOME,
+	WEB_PAGE_INTERFACES,
+	WEB_PAGE_SYSTEM
+};
+
+static const char *nav_active(enum web_page current, enum web_page item)
+{
+	return current == item ? "active" : "";
+}
+
+static void append_page_start(char *body, size_t bodysz,
+			      const struct app_config *cfg,
+			      const struct runtime_status *st,
+			      enum web_page page, const char *title,
+			      const char *subtitle, const char *message)
+{
+	char esc_title[128], esc_subtitle[256], esc_msg[512];
+	char esc_iface[128], esc_state[128], esc_ssid[256], esc_ip[128];
+	const char *state_color;
+	const char *state_label;
+
+	html_escape(esc_title, sizeof(esc_title), title ? title : "WPA Mini");
+	html_escape(esc_subtitle, sizeof(esc_subtitle), subtitle ? subtitle : "");
+	html_escape(esc_msg, sizeof(esc_msg), message ? message : "");
+	html_escape(esc_iface, sizeof(esc_iface), cfg->iface);
+	html_escape(esc_state, sizeof(esc_state), st->wpa_state);
+	html_escape(esc_ssid, sizeof(esc_ssid), st->ssid);
+	html_escape(esc_ip, sizeof(esc_ip), st->ip);
+	state_color = strcmp(st->wpa_state, "COMPLETED") == 0 ? "#2f7d4f" :
+		      st->engine_running ? "#936b20" : "#9b4444";
+	state_label = strcmp(st->wpa_state, "COMPLETED") == 0 ? "已连接" :
+		      st->engine_running ? "连接中" : "已停止";
+
+	buf_append(body, bodysz,
+		   "<!doctype html><html><head><meta charset=\"utf-8\">"
+		   "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+		   "<title>%s - WPA Mini</title>"
+		   "<style>"
+		   "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f4f8f2;color:#18251d}"
+		   "a{color:inherit;text-decoration:none}"
+		   "@keyframes rise{from{opacity:.62;transform:translateY(7px)}to{opacity:1;transform:none}}"
+		   "@keyframes pulse{0%%{box-shadow:0 0 0 0 rgba(47,125,79,.28)}100%%{box-shadow:0 0 0 14px rgba(47,125,79,0)}}"
+		   ".shell{min-height:100vh;display:grid;grid-template-columns:218px minmax(0,1fr)}"
+		   ".side{position:sticky;top:0;height:100vh;background:#fbfdf9;border-right:1px solid #dbe8dc;padding:18px 14px;display:flex;flex-direction:column;gap:16px}"
+		   ".brandbox{padding:4px 4px 10px}"
+		   ".brand{font-size:19px;font-weight:800}.sub,.hint{font-size:12px;color:#67786b;margin-top:3px;line-height:1.45}"
+		   ".nav{display:flex;flex-direction:column;gap:6px}.nav a{border-radius:8px;padding:10px 11px;color:#405246;font-size:14px;font-weight:700;transition:background .15s,color .15s,transform .15s}.nav a:hover{background:#eef7ef;transform:translateX(2px)}.nav a.active{background:#dcefe2;color:#1e5e3a}"
+		   ".sidecard{margin-top:auto;border:1px solid #dbe8dc;border-radius:8px;background:#fff;padding:12px}.pill{display:inline-block;border-radius:999px;padding:6px 10px;background:%s;color:#fff;font-size:13px;font-weight:800;white-space:nowrap}"
+		   "main.page{min-width:0;max-width:1160px;width:100%%;margin:0 auto;padding:22px 22px 30px}.topline{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:16px}.h1{font-size:25px;font-weight:800;letter-spacing:0}.topmeta{text-align:right;min-width:128px}"
+		   ".msg{background:#eef8f0;border:1px solid #c9dfd0;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.9fr);gap:14px}"
+		   ".panel{background:#fff;border:1px solid #d9e5dc;border-radius:8px;margin-bottom:14px;box-shadow:0 5px 16px rgba(24,37,29,.045);overflow:hidden;animation:rise .22s ease-out}.panel.hot{animation:pulse .7s ease-out}.formtop{border-bottom:1px solid #e7eee8;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px}.title{font-size:16px;font-weight:800}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.wide{grid-column:1/-1}"
+		   ".kv{border-bottom:1px solid #edf2ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e5dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:800;word-break:break-all;margin-top:3px}.smallv{font-size:12px;font-weight:700;line-height:1.45}"
+		   ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:800;margin:11px 0 5px}"
+		   "input{width:100%%;height:40px;border:1px solid #b8c7bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none;transition:border-color .15s,box-shadow .15s}"
+		   "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:700}"
+		   ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}button.alt,button.scan{background:#fff;color:#2f7d4f}"
+		   ".tablewrap{overflow:auto}.saved{border:1px solid #edf2ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:800;color:#1d3b29}.tag{display:inline-block;margin-left:5px;border-radius:5px;background:#e4f1e8;color:#286542;padding:2px 5px;font-size:11px}.focusrow{background:#f0f8f2}.defrow{background:#f8fbf3}.tinylink{font-size:12px;font-weight:800;color:#2f7d4f;border:1px solid #d1e5d7;border-radius:999px;padding:6px 9px;background:#fbfffc}"
+		   "table{width:100%%;border-collapse:collapse;font-size:13px;min-width:680px}th,td{text-align:left;border-bottom:1px solid #e7eee8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:800}"
+		   "@media(max-width:860px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc;padding:12px}.brandbox{padding-bottom:6px}.nav{flex-direction:row;overflow:auto}.nav a{white-space:nowrap}.sidecard{display:none}main.page{padding:16px}.topline{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}.topmeta{text-align:left}}"
+		   "</style></head><body><div class=\"shell\"><aside class=\"side\">"
+		   "<div class=\"brandbox\"><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div>"
+		   "<nav class=\"nav\"><a class=\"%s\" href=\"/\">控制台</a><a class=\"%s\" href=\"/interfaces\">网络接口</a><a class=\"%s\" href=\"/system_page\">系统信息</a></nav>"
+		   "<div class=\"sidecard\"><div class=\"pill\">%s</div><div class=\"hint\">接口 %s</div><div class=\"hint\">SSID %s</div></div>"
+		   "</aside><main class=\"page\"><div class=\"topline\"><div><div class=\"h1\">%s</div><div class=\"hint\">%s</div></div><div class=\"topmeta\"><div class=\"pill\">%s</div><div class=\"hint\">IP %s</div></div></div>",
+		   esc_title, state_color, nav_active(page, WEB_PAGE_HOME),
+		   nav_active(page, WEB_PAGE_INTERFACES),
+		   nav_active(page, WEB_PAGE_SYSTEM),
+		   state_label, esc_iface, esc_ssid[0] ? esc_ssid : "-",
+		   esc_title, esc_subtitle, state_label,
+		   esc_ip[0] ? esc_ip : "-");
+	if (message && *message)
+		buf_append(body, bodysz, "<section class=\"msg\">%s</section>",
+			   esc_msg);
+}
+
+static void append_page_end(char *body, size_t bodysz)
+{
+	buf_append(body, bodysz,
+		   "</main></div><script>"
+		   "function pickNet(b){var s=document.getElementById('ssidInput'),p=document.getElementById('pskInput'),c=document.getElementById('connectPanel');if(s)s.value=b.getAttribute('data-ssid')||'';if(c){c.classList.remove('hot');void c.offsetWidth;c.classList.add('hot');c.scrollIntoView({behavior:'smooth',block:'start'});}if(p)p.focus();}"
+		   "document.addEventListener('submit',function(e){var b=e.target.querySelector('button[type=submit]');if(b){b.classList.add('busy');b.textContent=b.textContent+'...';}});"
+		   "</script></body></html>");
+}
+
+static void append_home_content(char *body, size_t bodysz,
+				const struct app_config *cfg,
+				const struct runtime_status *st,
+				const char *scan_html,
+				const char *saved_html,
+				const char *autostart_html)
+{
+	char esc_ssid[256], esc_iface[128], esc_state[128], esc_bssid[128];
+	char esc_ip[128], esc_gw[128], esc_dns[256], esc_dns_path[512];
+	char esc_relay_lan[128], esc_relay_subnet[128], esc_relay_wan[128];
+	char esc_sta_subnet[128], esc_lan_subnet[128];
+	const char *connect_hint;
+	const char *share_state;
+	const char *share_action;
+	const char *share_button;
+	const char *share_class;
+	int share_ready;
+	int connected;
+
+	html_escape(esc_ssid, sizeof(esc_ssid), st->ssid);
+	html_escape(esc_iface, sizeof(esc_iface), cfg->iface);
+	html_escape(esc_state, sizeof(esc_state), st->wpa_state);
+	html_escape(esc_bssid, sizeof(esc_bssid), st->bssid);
+	html_escape(esc_ip, sizeof(esc_ip), st->ip);
+	html_escape(esc_gw, sizeof(esc_gw), st->gateway);
+	html_escape(esc_dns, sizeof(esc_dns), st->dns);
+	html_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
+	html_escape(esc_relay_lan, sizeof(esc_relay_lan),
+		    st->relay_lan_iface[0] ? st->relay_lan_iface : "br0");
+	html_escape(esc_relay_subnet, sizeof(esc_relay_subnet),
+		    st->relay_lan_subnet[0] ? st->relay_lan_subnet : "-");
+	html_escape(esc_relay_wan, sizeof(esc_relay_wan),
+		    st->relay_wan_iface[0] ? st->relay_wan_iface : cfg->iface);
+	html_escape(esc_sta_subnet, sizeof(esc_sta_subnet),
+		    st->sta_subnet[0] ? st->sta_subnet : "-");
+	html_escape(esc_lan_subnet, sizeof(esc_lan_subnet),
+		    st->lan_subnet[0] ? st->lan_subnet : "-");
+	connected = runtime_is_connected(st);
+	share_ready = connected && st->default_route_ready &&
+		      !st->sta_lan_conflict;
+	connect_hint = share_ready ? "本设备已通过这个 WiFi 获取地址并具备出口路由" :
+		       st->sta_lan_conflict ?
+		       "已关联 WiFi，但上游网段和热点/USB 网段冲突" :
+		       connected && !st->default_route_ready ?
+		       "已关联 WiFi，但没有默认网关，暂不能作为外网出口" :
+		       "本设备已通过这个 WiFi 获取地址";
+	share_state = st->sta_lan_conflict ? "网段冲突" :
+		      connected && !st->default_route_ready ? "缺少网关" :
+		      st->relay_enabled ? "已开启" : "未开启";
+	share_action = st->relay_enabled ? "/relay_off" :
+		       st->sta_lan_conflict ? "/relay_fix_lan" : "/relay_on";
+	share_button = st->relay_enabled ? "关闭共享网络" :
+		       st->sta_lan_conflict ?
+		       "调整热点/USB 网段并继续共享" :
+		       "共享网络给热点和 USB 设备";
+	share_class = st->relay_enabled ? " class=\"alt\"" : "";
+
+	buf_append(body, bodysz,
+		   "<div class=\"summary\">"
+		   "<div class=\"kv\"><div class=\"k\">接口</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">WPA 状态</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">SSID</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>"
+		   "</div>"
+		   "<div class=\"layout\">",
+		   esc_iface, esc_state, esc_ssid[0] ? esc_ssid : "-",
+		   esc_ip[0] ? esc_ip : "-");
+
+	if (connected) {
+		buf_append(body, bodysz,
+			   "<section class=\"panel\" id=\"connectPanel\"><div class=\"formtop\"><div><div class=\"title\">当前连接</div><div class=\"hint\">%s</div></div></div>"
+			   "<div class=\"pad\"><div class=\"grid\">"
+			   "<div class=\"kv\"><div class=\"k\">SSID</div><div class=\"v\">%s</div></div>"
+			   "<div class=\"kv\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>"
+			   "<div class=\"kv\"><div class=\"k\">网关</div><div class=\"v\">%s</div></div>"
+			   "<div class=\"kv\"><div class=\"k\">共享网络</div><div class=\"v\">%s</div></div>"
+			   "<div class=\"kv\"><div class=\"k\">上游网段</div><div class=\"v\">%s</div></div>"
+			   "<div class=\"kv\"><div class=\"k\">热点/USB 网段</div><div class=\"v\">%s</div></div>"
+			   "</div><div class=\"actions\">"
+			   "<form method=\"post\" action=\"%s\"><button type=\"submit\"%s>%s</button></form>"
+			   "<form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描 WiFi</button></form>"
+			   "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form>"
+			   "</div></div></section>",
+			   connect_hint,
+			   esc_ssid[0] ? esc_ssid : "-",
+			   esc_ip[0] ? esc_ip : "-",
+			   esc_gw[0] ? esc_gw : "-",
+			   share_state,
+			   esc_sta_subnet, esc_lan_subnet,
+			   share_action, share_class, share_button);
+	} else {
+		buf_append(body, bodysz,
+			   "<section class=\"panel\" id=\"connectPanel\"><div class=\"formtop\"><div><div class=\"title\">连接网络</div><div class=\"hint\">WPA/WPA2-PSK，DNS 文件：%s</div></div></div>"
+			   "<div class=\"pad\"><form method=\"post\" action=\"/connect\">"
+			   "<label>SSID</label><input id=\"ssidInput\" name=\"ssid\" maxlength=\"32\" value=\"%s\" autocomplete=\"off\" required>"
+			   "<label>密码或 64 位 HEX PSK</label><input id=\"pskInput\" name=\"psk\" type=\"password\" autocomplete=\"off\" required>"
+			   "<div class=\"twocol\"><div><label>DNS 1</label><input name=\"dns1\" value=\"" DEFAULT_DNS1 "\" inputmode=\"decimal\"></div>"
+			   "<div><label>DNS 2</label><input name=\"dns2\" value=\"" DEFAULT_DNS2 "\" inputmode=\"decimal\"></div></div>"
+			   "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">隐藏 SSID</label></div>"
+			   "<div class=\"check\"><input id=\"relay\" name=\"relay\" value=\"1\" type=\"checkbox\"><label for=\"relay\">连接后共享网络给热点和 USB 设备</label></div>"
+			   "<div class=\"actions\"><button type=\"submit\">连接</button></div></form>"
+			   "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描 WiFi</button></form>"
+			   "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form></div></div></section>",
+			   esc_dns_path, esc_ssid);
+	}
+
+	buf_append(body, bodysz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div><div class=\"title\">运行信息</div><div class=\"hint\">当前接口状态</div></div><a class=\"tinylink\" href=\"/interfaces\">查看接口</a></div><div class=\"pad\"><div class=\"grid\">"
+		   "<div class=\"kv\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">网关</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">中继/NAT</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">下层网络</div><div class=\"v\">%s %s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">上游出口</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">ip_forward / NAT</div><div class=\"v\">%d / %s</div></div>"
+		   "</div></div></section></div>%s%s%s",
+		   esc_bssid[0] ? esc_bssid : "-",
+		   esc_gw[0] ? esc_gw : "-",
+		   esc_dns[0] ? esc_dns : "-",
+		   st->engine_running ? (long)st->engine_pid : 0L,
+		   st->dhcp_running ? (long)st->dhcp_pid : 0L,
+		   st->relay_enabled ? "已启用" : "未启用",
+		   esc_relay_lan, esc_relay_subnet,
+		   esc_relay_wan,
+		   st->relay_ip_forward,
+		   st->relay_nat_rule ? "存在" : "无",
+		   autostart_html, saved_html, scan_html);
+}
+
 static void render_page(int fd, const struct app_config *cfg,
 			const char *message, const char *scan_text)
 {
 	struct runtime_status st;
-	char esc_ssid[256];
-	char esc_iface[128];
-	char esc_msg[512];
-	char esc_state[128];
-	char esc_bssid[128];
-	char esc_ip[128];
-	char esc_gw[128];
-	char esc_dns[256];
-	char esc_dns_path[512];
 	char *scan_html;
 	char *saved_html;
 	char *autostart_html;
-	char *system_html;
 	char *body;
-	const char *state_color;
-	const char *state_label;
 
-	log_msg(cfg, "render page message=%s scan=%d",
+	log_msg(cfg, "render home page message=%s scan=%d",
 		message ? message : "", scan_text && *scan_text ? 1 : 0);
 	scan_html = calloc(1, SCAN_HTML_MAX);
 	saved_html = calloc(1, SAVED_HTML_MAX);
 	autostart_html = calloc(1, AUTOSTART_HTML_MAX);
-	system_html = calloc(1, SYSTEM_HTML_MAX);
 	body = calloc(1, PAGE_BODY_MAX);
-	if (!scan_html || !saved_html || !autostart_html || !system_html ||
-	    !body) {
+	if (!scan_html || !saved_html || !autostart_html || !body) {
 		free(scan_html);
 		free(saved_html);
 		free(autostart_html);
-		free(system_html);
 		free(body);
-		log_msg(cfg, "render page allocation failed");
+		log_msg(cfg, "render home allocation failed");
 		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
 			  "out of memory\n");
 		return;
 	}
 
 	get_runtime_status(cfg, &st);
-	html_escape(esc_ssid, sizeof(esc_ssid), st.ssid);
-	html_escape(esc_iface, sizeof(esc_iface), cfg->iface);
-	html_escape(esc_msg, sizeof(esc_msg), message ? message : "");
-	html_escape(esc_state, sizeof(esc_state), st.wpa_state);
-	html_escape(esc_bssid, sizeof(esc_bssid), st.bssid);
-	html_escape(esc_ip, sizeof(esc_ip), st.ip);
-	html_escape(esc_gw, sizeof(esc_gw), st.gateway);
-	html_escape(esc_dns, sizeof(esc_dns), st.dns);
-	html_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
 	build_scan_html(scan_text, scan_html, SCAN_HTML_MAX);
 	build_saved_html(saved_html, SAVED_HTML_MAX);
 	build_autostart_html(autostart_html, AUTOSTART_HTML_MAX);
-	build_system_html(cfg, system_html, SYSTEM_HTML_MAX);
-
-	state_color = strcmp(st.wpa_state, "COMPLETED") == 0 ? "#257a4b" :
-		      st.engine_running ? "#9b6b13" : "#a34444";
-	state_label = strcmp(st.wpa_state, "COMPLETED") == 0 ? "已连接" :
-		      st.engine_running ? "连接中" : "已停止";
-
-	snprintf(body, PAGE_BODY_MAX,
-		 "<!doctype html><html><head><meta charset=\"utf-8\">"
-		 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-		 "<title>WPA Mini</title>"
-		 "<style>"
-		 "*{box-sizing:border-box}body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f5f7f4;color:#18251d}"
-		 "@keyframes rise{from{opacity:.65;transform:translateY(6px)}to{opacity:1;transform:none}}"
-		 "@keyframes pulse{0%%{box-shadow:0 0 0 0 rgba(47,125,79,.32)}100%%{box-shadow:0 0 0 14px rgba(47,125,79,0)}}"
-		 ".bar{background:#fff;border-bottom:1px solid #dde5de}.head{max-width:980px;margin:auto;padding:16px;display:flex;justify-content:space-between;align-items:center;gap:12px}"
-		 "main{max-width:980px;margin:16px auto 24px;padding:0 16px}.brand{font-size:21px;font-weight:700}.sub,.hint{font-size:12px;color:#66756b;margin-top:3px}"
-		 ".pill{border-radius:999px;padding:7px 11px;background:%s;color:#fff;font-size:13px;font-weight:700;white-space:nowrap}"
-		 ".summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:1.35fr .9fr;gap:14px}.panel{background:#fff;border:1px solid #d9e2dc;border-radius:8px;margin-bottom:14px;box-shadow:0 4px 14px rgba(24,37,29,.05);overflow:hidden;animation:rise .22s ease-out}.panel.hot{animation:pulse .7s ease-out}"
-		 ".formtop{border-bottom:1px solid #e7ece8;padding:14px 16px}.title{font-size:16px;font-weight:700}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}"
-		 ".kv{border-bottom:1px solid #edf1ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e2dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:700;word-break:break-all;margin-top:3px}.smallv{font-size:12px;font-weight:600;line-height:1.4}"
-		 ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:700;margin:11px 0 5px}"
-		 "input{width:100%%;height:40px;border:1px solid #b8c5bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none;transition:border-color .15s,box-shadow .15s}"
-		 "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:600}"
-		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}"
-		 "button.alt,button.scan{background:#fff;color:#2f7d4f}.msg{background:#f0f7f2;border:1px solid #cfe1d4;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px}.tablewrap{overflow:auto}"
-		 ".saved{border:1px solid #edf1ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:700;color:#1d3b29}.tag{display:inline-block;margin-left:5px;border-radius:5px;background:#e4f1e8;color:#286542;padding:2px 5px;font-size:11px}.focusrow{background:#f0f8f2}.defrow{background:#f8fbf3}"
-		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e7ece8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:700}"
-		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}}"
-		 "</style></head><body><div class=\"bar\"><div class=\"head\"><div><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
-		 "%s%s%s"
-		 "<div class=\"summary\">"
-		 "<div class=\"kv\"><div class=\"k\">接口</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">WPA 状态</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">SSID</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">IP</div><div class=\"v\">%s</div></div>"
-		 "</div>"
-		 "<div class=\"layout\"><section class=\"panel\" id=\"connectPanel\"><div class=\"formtop\"><div><div class=\"title\">连接网络</div><div class=\"hint\">WPA/WPA2-PSK，DNS 文件：%s</div></div></div>"
-		 "<div class=\"pad\"><form method=\"post\" action=\"/connect\">"
-		 "<label>SSID</label><input id=\"ssidInput\" name=\"ssid\" maxlength=\"32\" value=\"%s\" autocomplete=\"off\" required>"
-		 "<label>BSSID</label><input id=\"bssidInput\" name=\"bssid\" maxlength=\"17\" placeholder=\"可选，锁定指定 AP\" autocomplete=\"off\">"
-		 "<label>密码或 64 位 HEX PSK</label><input id=\"pskInput\" name=\"psk\" type=\"password\" autocomplete=\"off\" required>"
-		 "<div class=\"twocol\"><div><label>DNS 1</label><input name=\"dns1\" value=\"" DEFAULT_DNS1 "\" inputmode=\"decimal\"></div>"
-		 "<div><label>DNS 2</label><input name=\"dns2\" value=\"" DEFAULT_DNS2 "\" inputmode=\"decimal\"></div></div>"
-		 "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">隐藏 SSID</label></div>"
-		 "<div class=\"check\"><input id=\"route\" name=\"route\" value=\"1\" type=\"checkbox\"><label for=\"route\">使用 STA 作为默认路由</label></div>"
-		 "<div class=\"actions\"><button type=\"submit\">连接</button></div></form>"
-		 "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描 WiFi</button></form>"
-		 "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form></div></div></section>"
-		 "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">运行信息</div><div class=\"hint\">当前接口状态</div></div><div class=\"pad\"><div class=\"grid\">"
-		 "<div class=\"kv\"><div class=\"k\">BSSID</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">网关</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
-		 "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
-		 "</div></div></section></div>%s%s%s%s</main>"
-		 "<script>"
-		 "function pickNet(b){var s=document.getElementById('ssidInput'),m=document.getElementById('bssidInput'),p=document.getElementById('pskInput'),c=document.getElementById('connectPanel');if(s)s.value=b.getAttribute('data-ssid')||'';if(m)m.value=b.getAttribute('data-bssid')||'';if(c){c.classList.remove('hot');void c.offsetWidth;c.classList.add('hot');c.scrollIntoView({behavior:'smooth',block:'start'});}if(p)p.focus();}"
-		 "document.addEventListener('submit',function(e){var b=e.target.querySelector('button[type=submit]');if(b){b.classList.add('busy');b.textContent=b.textContent+'...';}});"
-		 "</script></body></html>",
-		 state_color,
-		 state_label,
-		 message ? "<section class=\"msg\">" : "",
-		 message ? esc_msg : "",
-		 message ? "</section>" : "",
-		 esc_iface,
-		 esc_state,
-		 esc_ssid[0] ? esc_ssid : "-",
-		 esc_ip[0] ? esc_ip : "-",
-		 esc_dns_path,
-		 esc_ssid,
-		 esc_bssid[0] ? esc_bssid : "-",
-		 esc_gw[0] ? esc_gw : "-",
-		 esc_dns[0] ? esc_dns : "-",
-		 st.engine_running ? (long)st.engine_pid : 0L,
-		 st.dhcp_running ? (long)st.dhcp_pid : 0L,
-		 system_html,
-		 autostart_html,
-		 saved_html,
-		 scan_html);
+	append_page_start(body, PAGE_BODY_MAX, cfg, &st, WEB_PAGE_HOME,
+			  "控制台", "连接 WiFi、扫描网络、管理已保存配置", message);
+	append_home_content(body, PAGE_BODY_MAX, cfg, &st, scan_html,
+			    saved_html, autostart_html);
+	append_page_end(body, PAGE_BODY_MAX);
 
 	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
 	free(scan_html);
 	free(saved_html);
 	free(autostart_html);
-	free(system_html);
+	free(body);
+}
+
+static void render_interfaces_page(int fd, const struct app_config *cfg)
+{
+	struct runtime_status st;
+	char *content;
+	char *body;
+
+	log_msg(cfg, "render interfaces page");
+	content = calloc(1, SYSTEM_HTML_MAX);
+	body = calloc(1, PAGE_BODY_MAX);
+	if (!content || !body) {
+		free(content);
+		free(body);
+		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
+			  "out of memory\n");
+		return;
+	}
+	get_runtime_status(cfg, &st);
+	build_interfaces_html(cfg, content, SYSTEM_HTML_MAX);
+	append_page_start(body, PAGE_BODY_MAX, cfg, &st, WEB_PAGE_INTERFACES,
+			  "网络接口", "接口、路由和 ARP 表，只读展示", NULL);
+	buf_append(body, PAGE_BODY_MAX, "%s", content);
+	append_page_end(body, PAGE_BODY_MAX);
+	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
+	free(content);
+	free(body);
+}
+
+static void render_system_page(int fd, const struct app_config *cfg)
+{
+	struct runtime_status st;
+	char *content;
+	char *body;
+
+	log_msg(cfg, "render system html page");
+	content = calloc(1, SYSTEM_HTML_MAX);
+	body = calloc(1, PAGE_BODY_MAX);
+	if (!content || !body) {
+		free(content);
+		free(body);
+		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
+			  "out of memory\n");
+		return;
+	}
+	get_runtime_status(cfg, &st);
+	build_system_page_html(cfg, content, SYSTEM_HTML_MAX);
+	append_page_start(body, PAGE_BODY_MAX, cfg, &st, WEB_PAGE_SYSTEM,
+			  "系统信息", "主机状态、监听端口和关键挂载点", NULL);
+	buf_append(body, PAGE_BODY_MAX, "%s", content);
+	append_page_end(body, PAGE_BODY_MAX);
+	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
+	free(content);
 	free(body);
 }
 
@@ -3888,7 +4794,9 @@ static void render_status(int fd, const struct app_config *cfg)
 	struct runtime_status st;
 	char esc_ssid[256], esc_state[128], esc_bssid[128], esc_ip[128];
 	char esc_gw[128], esc_dns[256], esc_key[128], esc_iface[128];
-	char esc_dns_path[512], body[2048];
+	char esc_dns_path[512], esc_relay_lan[128], esc_relay_subnet[128];
+	char esc_relay_wan[128], esc_sta_subnet[128], esc_lan_subnet[128];
+	char body[4096];
 
 	log_msg(cfg, "render status");
 	get_runtime_status(cfg, &st);
@@ -3901,6 +4809,12 @@ static void render_status(int fd, const struct app_config *cfg)
 	json_escape(esc_dns, sizeof(esc_dns), st.dns);
 	json_escape(esc_key, sizeof(esc_key), st.key_mgmt);
 	json_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
+	json_escape(esc_relay_lan, sizeof(esc_relay_lan), st.relay_lan_iface);
+	json_escape(esc_relay_subnet, sizeof(esc_relay_subnet),
+		    st.relay_lan_subnet);
+	json_escape(esc_relay_wan, sizeof(esc_relay_wan), st.relay_wan_iface);
+	json_escape(esc_sta_subnet, sizeof(esc_sta_subnet), st.sta_subnet);
+	json_escape(esc_lan_subnet, sizeof(esc_lan_subnet), st.lan_subnet);
 
 	snprintf(body, sizeof(body),
 		 "{\"engine_running\":%s,\"engine_pid\":%ld,"
@@ -3908,13 +4822,26 @@ static void render_status(int fd, const struct app_config *cfg)
 		 "\"iface\":\"%s\",\"wpa_state\":\"%s\",\"ssid\":\"%s\","
 		 "\"bssid\":\"%s\",\"key_mgmt\":\"%s\",\"ip\":\"%s\","
 		 "\"gateway\":\"%s\",\"dns\":\"%s\",\"dns_path\":\"%s\","
+		 "\"sta_subnet\":\"%s\",\"lan_subnet\":\"%s\","
+		 "\"default_route_ready\":%s,\"sta_lan_conflict\":%s,"
+		 "\"relay_enabled\":%s,\"relay_lan_iface\":\"%s\","
+		 "\"relay_lan_subnet\":\"%s\",\"relay_wan_iface\":\"%s\","
+		 "\"relay_ip_forward\":%d,\"relay_nat_rule\":%s,"
 		 "\"port\":%d}\n",
 		 st.engine_running ? "true" : "false",
 		 st.engine_running ? (long)st.engine_pid : 0L,
 		 st.dhcp_running ? "true" : "false",
 		 st.dhcp_running ? (long)st.dhcp_pid : 0L,
 		 esc_iface, esc_state, esc_ssid, esc_bssid, esc_key,
-		 esc_ip, esc_gw, esc_dns, esc_dns_path, cfg->port);
+		 esc_ip, esc_gw, esc_dns, esc_dns_path,
+		 esc_sta_subnet, esc_lan_subnet,
+		 st.default_route_ready ? "true" : "false",
+		 st.sta_lan_conflict ? "true" : "false",
+		 st.relay_enabled ? "true" : "false",
+		 esc_relay_lan, esc_relay_subnet, esc_relay_wan,
+		 st.relay_ip_forward,
+		 st.relay_nat_rule ? "true" : "false",
+		 cfg->port);
 	http_send(fd, cfg, 200, "OK", "application/json", body);
 }
 
@@ -3975,9 +4902,9 @@ static int content_length(const char *headers)
 
 static void connect_wifi_request(int fd, const struct app_config *cfg,
 				 const char *ssid, const char *psk,
-				 const char *bssid, const char *dns1,
+				 const char *dns1,
 				 const char *dns2, int hidden, int use_route,
-				 int remember)
+				 int relay, int remember)
 {
 	char use_dns1[64];
 	char use_dns2[64];
@@ -3986,27 +4913,25 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 		 dns1 && dns1[0] ? dns1 : DEFAULT_DNS1);
 	snprintf(use_dns2, sizeof(use_dns2), "%s",
 		 dns2 && dns2[0] ? dns2 : DEFAULT_DNS2);
-	log_msg(cfg, "connect request ssid=%s bssid=%s hidden=%d route=%d dns1=%s dns2=%s",
-		ssid, bssid ? bssid : "", hidden, use_route, use_dns1, use_dns2);
+	if (relay)
+		use_route = 1;
+	log_msg(cfg, "connect request ssid=%s hidden=%d route=%d relay=%d dns1=%s dns2=%s",
+		ssid, hidden, use_route, relay, use_dns1, use_dns2);
 
 	if (!valid_ipv4_or_empty(use_dns1) || !valid_ipv4_or_empty(use_dns2)) {
 		log_msg(cfg, "connect rejected: invalid dns");
 		render_page(fd, cfg, "DNS 必须是有效的 IPv4 地址。", NULL);
 		return;
 	}
-	if (!valid_bssid_or_empty(bssid)) {
-		log_msg(cfg, "connect rejected: invalid bssid");
-		render_page(fd, cfg, "BSSID 可以留空，填写时必须是 MAC 地址格式。", NULL);
-		return;
-	}
 
-	if (write_config(cfg->conf, cfg->ctrl_dir, ssid, psk, bssid, hidden) < 0) {
+	if (write_config(cfg->conf, cfg->ctrl_dir, ssid, psk, hidden) < 0) {
 		log_msg(cfg, "connect rejected: config write failed errno=%d", errno);
 		render_page(fd, cfg, "配置写入失败，请检查 SSID 和密码长度。", NULL);
 		return;
 	}
 
 	stop_dhcp(cfg);
+	stop_relay(cfg);
 	deconfigure_iface(cfg);
 
 	if (start_engine_process(cfg) < 0) {
@@ -4021,7 +4946,8 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 	}
 
 	if (remember)
-		remember_wifi(ssid, psk, bssid, use_dns1, use_dns2, hidden, use_route);
+		remember_wifi(ssid, psk, use_dns1, use_dns2, hidden,
+			      use_route, relay);
 
 	if (start_dhcp(cfg, use_dns1, use_dns2, use_route) < 0) {
 		render_page(fd, cfg, "WiFi 已连接，但 udhcpc 启动失败。", NULL);
@@ -4034,6 +4960,11 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 		return;
 	}
 
+	if (relay && start_relay(cfg, use_dns1, use_dns2) < 0) {
+		render_page(fd, cfg, "WiFi 已连接，但中继/NAT 启用失败。", NULL);
+		return;
+	}
+
 	log_msg(cfg, "connect completed");
 	http_redirect(fd, cfg, "/");
 }
@@ -4042,23 +4973,23 @@ static void handle_connect(int fd, const struct app_config *cfg,
 			   const char *body)
 {
 	char ssid[96];
-	char bssid[32];
 	char psk[128];
 	char dns1[64];
 	char dns2[64];
 	char value[16];
 	int hidden;
 	int use_route;
+	int relay;
 
 	form_value(body, "ssid", ssid, sizeof(ssid));
-	form_value(body, "bssid", bssid, sizeof(bssid));
 	form_value(body, "psk", psk, sizeof(psk));
 	form_value(body, "dns1", dns1, sizeof(dns1));
 	form_value(body, "dns2", dns2, sizeof(dns2));
 	hidden = form_value(body, "hidden", value, sizeof(value)) && value[0];
-	use_route = form_value(body, "route", value, sizeof(value)) && value[0];
-	connect_wifi_request(fd, cfg, ssid, psk, bssid, dns1, dns2, hidden,
-			     use_route, 1);
+	relay = form_value(body, "relay", value, sizeof(value)) && value[0];
+	use_route = 1;
+	connect_wifi_request(fd, cfg, ssid, psk, dns1, dns2, hidden,
+			     use_route, relay, 1);
 }
 
 static void handle_connect_saved(int fd, const struct app_config *cfg,
@@ -4089,20 +5020,18 @@ static void handle_connect_saved(int fd, const struct app_config *cfg,
 		return;
 	}
 	connect_wifi_request(fd, cfg, items[idx].ssid, items[idx].psk,
-			     items[idx].bssid, items[idx].dns1, items[idx].dns2,
-			     items[idx].hidden, items[idx].route, 1);
+			     items[idx].dns1, items[idx].dns2, items[idx].hidden,
+			     1, items[idx].relay, 1);
 }
 
 static void handle_forget(int fd, const struct app_config *cfg,
 			  const char *body)
 {
 	char ssid[96];
-	char bssid[32];
 
 	form_value(body, "ssid", ssid, sizeof(ssid));
-	form_value(body, "bssid", bssid, sizeof(bssid));
 	if (ssid[0])
-		forget_wifi(ssid, bssid);
+		forget_wifi(ssid);
 	http_redirect(fd, cfg, "/");
 }
 
@@ -4183,6 +5112,101 @@ static void handle_autostart_off(int fd, const struct app_config *cfg)
 
 	log_msg(cfg, "autostart disabled");
 	render_page(fd, cfg, "开机自启动已关闭。", NULL);
+}
+
+static void handle_relay_on(int fd, const struct app_config *cfg)
+{
+	struct runtime_status st;
+	char dns1[64];
+	char dns2[64];
+
+	get_runtime_status(cfg, &st);
+	if (!runtime_is_connected(&st)) {
+		render_page(fd, cfg, "请先连接 WiFi，获取 IP 后才能共享网络。", NULL);
+		return;
+	}
+	if (st.sta_lan_conflict) {
+		render_page(fd, cfg,
+			    "不能开启共享网络：上游 WiFi 网段和本机热点/USB 网段相同，请更换上游 WiFi 或调整本机 LAN 网段。",
+			    NULL);
+		return;
+	}
+	if (!st.default_route_ready) {
+		render_page(fd, cfg,
+			    "不能开启共享网络：当前 WiFi 没有默认网关，设备还不能通过它访问外网。",
+			    NULL);
+		return;
+	}
+
+	read_dns_pair(cfg->dns_path, dns1, sizeof(dns1), dns2, sizeof(dns2));
+	if (!dns1[0])
+		snprintf(dns1, sizeof(dns1), "%s", DEFAULT_DNS1);
+	if (!dns2[0])
+		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
+
+	if (start_relay(cfg, dns1, dns2) < 0) {
+		render_page(fd, cfg, "共享网络启用失败，请检查 br0、iptables 和日志。", NULL);
+		return;
+	}
+
+	log_msg(cfg, "relay enabled by webui");
+	render_page(fd, cfg, "已开启共享网络。", NULL);
+}
+
+static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
+{
+	struct runtime_status st;
+	uint32_t net_host;
+	char new_subnet[64];
+	char dns1[64];
+	char dns2[64];
+
+	get_runtime_status(cfg, &st);
+	if (!runtime_is_connected(&st)) {
+		render_page(fd, cfg, "请先连接 WiFi，获取 IP 后才能调整共享网段。", NULL);
+		return;
+	}
+	if (!st.sta_lan_conflict) {
+		http_redirect(fd, cfg, "/");
+		return;
+	}
+	if (choose_lan_subnet(&net_host) < 0) {
+		render_page(fd, cfg, "没有找到可用的热点/USB 网段。", NULL);
+		return;
+	}
+	if (adjust_lan_subnet(cfg, net_host, new_subnet, sizeof(new_subnet)) < 0) {
+		render_page(fd, cfg, "热点/USB 网段调整失败，请查看日志。", NULL);
+		return;
+	}
+
+	stop_dhcp(cfg);
+	if (start_dhcp(cfg, DEFAULT_DNS1, DEFAULT_DNS2, 1) < 0 ||
+	    wait_ipv4_ready(cfg, 8000) < 0) {
+		render_page(fd, cfg,
+			    "热点/USB 网段已调整，但 WiFi 出口 DHCP 还没有恢复。",
+			    NULL);
+		return;
+	}
+	read_dns_pair(cfg->dns_path, dns1, sizeof(dns1), dns2, sizeof(dns2));
+	if (!dns1[0])
+		snprintf(dns1, sizeof(dns1), "%s", DEFAULT_DNS1);
+	if (!dns2[0])
+		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
+	if (start_relay(cfg, dns1, dns2) < 0) {
+		render_page(fd, cfg,
+			    "热点/USB 网段已调整，但共享网络启用失败。",
+			    NULL);
+		return;
+	}
+	log_msg(cfg, "relay fix lan completed subnet=%s", new_subnet);
+	render_page(fd, cfg, "已调整热点/USB 网段并开启共享网络。", NULL);
+}
+
+static void handle_relay_off(int fd, const struct app_config *cfg)
+{
+	stop_relay(cfg);
+	log_msg(cfg, "relay disabled by webui");
+	render_page(fd, cfg, "已关闭共享网络。", NULL);
 }
 
 static void handle_client(int fd, const struct app_config *cfg)
@@ -4278,6 +5302,12 @@ static void handle_client(int fd, const struct app_config *cfg)
 
 	if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
 		render_page(fd, cfg, NULL, NULL);
+	} else if (strcmp(method, "GET") == 0 &&
+		   strcmp(path, "/interfaces") == 0) {
+		render_interfaces_page(fd, cfg);
+	} else if (strcmp(method, "GET") == 0 &&
+		   strcmp(path, "/system_page") == 0) {
+		render_system_page(fd, cfg);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/status") == 0) {
 		render_status(fd, cfg);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/system") == 0) {
@@ -4303,8 +5333,18 @@ static void handle_client(int fd, const struct app_config *cfg)
 		   strcmp(path, "/autostart_off") == 0) {
 		handle_autostart_off(fd, cfg);
 	} else if (strcmp(method, "POST") == 0 &&
+		   strcmp(path, "/relay_on") == 0) {
+		handle_relay_on(fd, cfg);
+	} else if (strcmp(method, "POST") == 0 &&
+		   strcmp(path, "/relay_fix_lan") == 0) {
+		handle_relay_fix_lan(fd, cfg);
+	} else if (strcmp(method, "POST") == 0 &&
+		   strcmp(path, "/relay_off") == 0) {
+		handle_relay_off(fd, cfg);
+	} else if (strcmp(method, "POST") == 0 &&
 		   strcmp(path, "/disconnect") == 0) {
 		stop_dhcp(cfg);
+		stop_relay(cfg);
 		stop_engine(cfg);
 		deconfigure_iface(cfg);
 		http_redirect(fd, cfg, "/");
@@ -4386,6 +5426,7 @@ int main(int argc, char **argv)
 	int dry_run = 0;
 	int hidden = 0;
 	int use_default_route = 0;
+	int relay = 0;
 	int web = 0;
 	int opt;
 
@@ -4401,7 +5442,7 @@ int main(int argc, char **argv)
 	cfg.udhcpc = DEFAULT_UDHCPC;
 	cfg.port = DEFAULT_PORT;
 
-	while ((opt = getopt(argc, argv, "wi:s:p:c:C:D:P:L:r:l:u:HMFnh")) != -1) {
+	while ((opt = getopt(argc, argv, "wi:s:p:c:C:D:P:L:r:l:u:HMNFnh")) != -1) {
 		switch (opt) {
 		case 'w':
 			web = 1;
@@ -4445,6 +5486,10 @@ int main(int argc, char **argv)
 		case 'M':
 			use_default_route = 1;
 			break;
+		case 'N':
+			relay = 1;
+			use_default_route = 1;
+			break;
 		case 'F':
 			foreground = 1;
 			break;
@@ -4484,7 +5529,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	if (write_config(cfg.conf, cfg.ctrl_dir, ssid, psk, "", hidden) < 0)
+	if (write_config(cfg.conf, cfg.ctrl_dir, ssid, psk, hidden) < 0)
 		return 1;
 	log_msg(&cfg, "one-shot config written ssid=%s hidden=%d", ssid, hidden);
 
@@ -4499,6 +5544,7 @@ int main(int argc, char **argv)
 	}
 
 	stop_dhcp(&cfg);
+	stop_relay(&cfg);
 	deconfigure_iface(&cfg);
 
 	if (start_engine_process(&cfg) < 0) {
@@ -4518,8 +5564,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "warning: failed to start udhcpc\n");
 	else if (wait_ipv4_ready(&cfg, 8000) < 0)
 		fprintf(stderr, "warning: DHCP has not assigned an IP yet\n");
+	else if (relay && start_relay(&cfg, DEFAULT_DNS1, DEFAULT_DNS2) < 0)
+		fprintf(stderr, "warning: failed to enable WiFi relay/NAT\n");
 
-	log_msg(&cfg, "one-shot completed foreground=%d", foreground);
+	log_msg(&cfg, "one-shot completed foreground=%d relay=%d",
+		foreground, relay);
 	if (foreground) {
 		for (;;)
 			pause();
