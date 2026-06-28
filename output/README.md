@@ -8,7 +8,7 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `449496` 字节，`wpa_mini.run` 大小为 `314701` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `453448` 字节，`wpa_mini.run` 大小为 `317412` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
 
 ## 功能
 
@@ -17,6 +17,7 @@
 - 中文轻量设备控制台页面。
 - 扫描周围 WiFi。
 - 连接 WPA/WPA2-PSK 网络。
+- 连接成功后记忆 WiFi，并可在 WebUI 一键重连或删除。
 - 可选锁定 BSSID。
 - 调用目标系统 `/sbin/udhcpc` 获取 DHCP。
 - 写入 DNS 到 `/mnt/userdata/etc_rw/resolv.conf`，默认使用阿里 `223.5.5.5` 和腾讯 `119.29.29.29`。
@@ -91,6 +92,7 @@ chmod +x /mnt/userdata/wpa_mini.run
 | DHCP pid | `/tmp/wpa_mini_udhcpc.pid` |
 | DHCP 脚本 | `/tmp/wpa_mini_udhcpc.sh` |
 | DNS 文件 | `/mnt/userdata/etc_rw/resolv.conf` |
+| 已保存 WiFi | `/mnt/userdata/etc_rw/wpa_mini_saved.conf` |
 | 默认 DNS1 | `223.5.5.5` |
 | 默认 DNS2 | `119.29.29.29` |
 | 日志文件 | `/tmp/wpa_mini.log` |
@@ -114,7 +116,9 @@ http://<设备IP>:51400/
 4. 输入 SSID 和密码，必要时填写 BSSID、DNS1/DNS2。
 5. 如需让设备默认从 WiFi STA 出网，勾选 `使用 STA 作为默认路由`；默认不要勾选。
 6. 点击 `连接`。
-7. 需要断开时点击 `断开`。
+7. 连接成功后，该 WiFi 会出现在 `已保存 WiFi` 区域。
+8. 后续可在 `已保存 WiFi` 中点击 `连接` 一键重连，或点击 `删除` 移除记录。
+9. 需要断开时点击 `断开`。
 
 ## HTTP 接口
 
@@ -160,6 +164,20 @@ curl -X POST \
 curl -X POST \
   -d 'ssid=MyWiFi&psk=password123&route=1' \
   http://127.0.0.1:51400/connect
+```
+
+使用已保存 WiFi 连接，`idx` 是 WebUI 中保存列表的顺序，从 `0` 开始：
+
+```sh
+curl -X POST -d 'idx=0' http://127.0.0.1:51400/connect_saved
+```
+
+删除已保存 WiFi：
+
+```sh
+curl -X POST \
+  -d 'ssid=MyWiFi&bssid=' \
+  http://127.0.0.1:51400/forget
 ```
 
 断开连接：
@@ -212,7 +230,7 @@ network={
 }
 ```
 
-普通 8-63 字节密码会在程序内部通过 PBKDF2 派生成 64 位 hex PSK 后写入配置；如果输入本身已经是 64 位 hex PSK，则直接写入。这样配置文件和日志里不需要保存明文 WiFi 密码。
+普通 8-63 字节密码会在程序内部通过 PBKDF2 派生成 64 位 hex PSK 后写入 WPA 运行配置；如果输入本身已经是 64 位 hex PSK，则直接写入。运行配置和日志里不需要保存明文 WiFi 密码，WebUI 的已保存 WiFi 列表会按明文保存密码。
 
 隐藏 SSID 会额外加入：
 
@@ -247,6 +265,16 @@ DNS 默认写入：
 nameserver 223.5.5.5
 nameserver 119.29.29.29
 ```
+
+## 已保存 WiFi
+
+WebUI 连接成功后会把 SSID、密码、BSSID、DNS、隐藏 SSID 和默认路由选项保存到：
+
+```sh
+/mnt/userdata/etc_rw/wpa_mini_saved.conf
+```
+
+保存文件权限为 `0600`。密码按明文保存，适合该设备的本地持久使用场景；如果设备控制权已经泄露，应视为 WiFi 密码也已经泄露。
 
 ## 日志排查
 
@@ -342,4 +370,4 @@ fi
 
 ## 安全注意
 
-WebUI 没有登录认证，建议只在可信局域网或调试环境中开放。不要把 `51400` 端口直接暴露到不可信网络。
+WebUI 没有登录认证，建议只在可信局域网或调试环境中开放。不要把 `51400` 端口直接暴露到不可信网络。已保存 WiFi 文件中包含明文密码，应避免让不可信用户获得设备 shell 或文件读取权限。

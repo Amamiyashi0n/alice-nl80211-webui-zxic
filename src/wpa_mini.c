@@ -33,6 +33,7 @@
 #define DEFAULT_DHCP_PIDFILE "/tmp/wpa_mini_udhcpc.pid"
 #define DEFAULT_DHCP_SCRIPT "/tmp/wpa_mini_udhcpc.sh"
 #define DEFAULT_DNS_PATH "/mnt/userdata/etc_rw/resolv.conf"
+#define DEFAULT_SAVED_PATH "/mnt/userdata/etc_rw/wpa_mini_saved.conf"
 #define DEFAULT_DNS1 "223.5.5.5"
 #define DEFAULT_DNS2 "119.29.29.29"
 #define DEFAULT_LOG_PATH "/tmp/wpa_mini.log"
@@ -45,7 +46,9 @@
 #define STATUS_REPLY_MAX 2048
 #define SCAN_TEXT_MAX 16384
 #define SCAN_HTML_MAX 20000
-#define PAGE_BODY_MAX 32768
+#define SAVED_HTML_MAX 12000
+#define PAGE_BODY_MAX 49152
+#define SAVED_WIFI_MAX 8
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -115,6 +118,16 @@ struct runtime_status {
 	char ip[64];
 	char gateway[64];
 	char dns[192];
+};
+
+struct saved_wifi {
+	char ssid[96];
+	char psk[128];
+	char bssid[32];
+	char dns1[64];
+	char dns2[64];
+	int hidden;
+	int route;
 };
 
 /*
@@ -1852,6 +1865,158 @@ static int form_value(const char *body, const char *key,
 	return 0;
 }
 
+static void url_encode(char *out, size_t outsz, const char *in)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t used = 0;
+
+	if (!outsz)
+		return;
+
+	while (*in && used + 1 < outsz) {
+		unsigned char c = (unsigned char)*in++;
+
+		if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+			out[used++] = (char)c;
+		} else {
+			if (used + 3 >= outsz)
+				break;
+			out[used++] = '%';
+			out[used++] = hex[c >> 4];
+			out[used++] = hex[c & 0x0f];
+		}
+	}
+	out[used] = '\0';
+}
+
+static int load_saved_wifi(struct saved_wifi *items, int max_items)
+{
+	FILE *fp;
+	char line[1024];
+	int count = 0;
+
+	fp = fopen(DEFAULT_SAVED_PATH, "r");
+	if (!fp)
+		return 0;
+
+	while (count < max_items && fgets(line, sizeof(line), fp)) {
+		struct saved_wifi item;
+		char value[16];
+		size_t len;
+
+		memset(&item, 0, sizeof(item));
+		len = strcspn(line, "\r\n");
+		line[len] = '\0';
+		if (!form_value(line, "ssid", item.ssid, sizeof(item.ssid)) ||
+		    !form_value(line, "psk", item.psk, sizeof(item.psk)))
+			continue;
+		form_value(line, "bssid", item.bssid, sizeof(item.bssid));
+		form_value(line, "dns1", item.dns1, sizeof(item.dns1));
+		form_value(line, "dns2", item.dns2, sizeof(item.dns2));
+		item.hidden = form_value(line, "hidden", value, sizeof(value)) &&
+			      value[0] == '1';
+		item.route = form_value(line, "route", value, sizeof(value)) &&
+			     value[0] == '1';
+		if (!valid_psk(item.psk) || !valid_bssid_or_empty(item.bssid) ||
+		    !valid_ipv4_or_empty(item.dns1) ||
+		    !valid_ipv4_or_empty(item.dns2))
+			continue;
+		items[count++] = item;
+	}
+
+	fclose(fp);
+	return count;
+}
+
+static int save_saved_wifi(const struct saved_wifi *items, int count)
+{
+	int fd;
+	FILE *fp;
+	int i;
+
+	if (mkdir_parent(DEFAULT_SAVED_PATH) < 0)
+		return -1;
+
+	fd = open(DEFAULT_SAVED_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	fp = fdopen(fd, "w");
+	if (!fp) {
+		close(fd);
+		return -1;
+	}
+
+	for (i = 0; i < count; i++) {
+		char ssid[288], psk[384], bssid[96], dns1[192], dns2[192];
+
+		url_encode(ssid, sizeof(ssid), items[i].ssid);
+		url_encode(psk, sizeof(psk), items[i].psk);
+		url_encode(bssid, sizeof(bssid), items[i].bssid);
+		url_encode(dns1, sizeof(dns1), items[i].dns1);
+		url_encode(dns2, sizeof(dns2), items[i].dns2);
+		fprintf(fp, "ssid=%s&psk=%s&bssid=%s&dns1=%s&dns2=%s&hidden=%d&route=%d\n",
+			ssid, psk, bssid, dns1, dns2, items[i].hidden ? 1 : 0,
+			items[i].route ? 1 : 0);
+	}
+
+	if (fclose(fp) != 0)
+		return -1;
+	chmod(DEFAULT_SAVED_PATH, 0600);
+	return 0;
+}
+
+static void remember_wifi(const char *ssid, const char *psk,
+			  const char *bssid, const char *dns1,
+			  const char *dns2, int hidden, int route)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	struct saved_wifi kept[SAVED_WIFI_MAX];
+	struct saved_wifi next;
+	int count;
+	int i;
+	int out = 0;
+
+	memset(&next, 0, sizeof(next));
+	snprintf(next.ssid, sizeof(next.ssid), "%s", ssid);
+	snprintf(next.psk, sizeof(next.psk), "%s", psk);
+	snprintf(next.bssid, sizeof(next.bssid), "%s", bssid ? bssid : "");
+	snprintf(next.dns1, sizeof(next.dns1), "%s", dns1 ? dns1 : DEFAULT_DNS1);
+	snprintf(next.dns2, sizeof(next.dns2), "%s", dns2 ? dns2 : DEFAULT_DNS2);
+	next.hidden = hidden ? 1 : 0;
+	next.route = route ? 1 : 0;
+
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	kept[out++] = next;
+	for (i = 0; i < count; i++) {
+		if (strcmp(items[i].ssid, next.ssid) == 0 &&
+		    strcmp(items[i].bssid, next.bssid) == 0)
+			continue;
+		if (out < SAVED_WIFI_MAX)
+			kept[out++] = items[i];
+	}
+
+	save_saved_wifi(kept, out);
+}
+
+static int forget_wifi(const char *ssid, const char *bssid)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	struct saved_wifi kept[SAVED_WIFI_MAX];
+	int count;
+	int out = 0;
+	int i;
+
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	for (i = 0; i < count; i++) {
+		if (strcmp(items[i].ssid, ssid) == 0 &&
+		    strcmp(items[i].bssid, bssid ? bssid : "") == 0)
+			continue;
+		kept[out++] = items[i];
+	}
+
+	return save_saved_wifi(kept, out);
+}
+
 static int read_current_ssid(const char *conf, char *out, size_t outsz)
 {
 	FILE *fp;
@@ -2371,6 +2536,50 @@ static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 	free(copy);
 }
 
+static void build_saved_html(char *out, size_t outsz)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	int count;
+	int i;
+
+	if (outsz)
+		out[0] = '\0';
+
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	buf_append(out, outsz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">已保存 WiFi</div>"
+		   "<div class=\"hint\">保存在 " DEFAULT_SAVED_PATH "，密码为明文</div>"
+		   "</div></div><div class=\"pad\">");
+	if (!count) {
+		buf_append(out, outsz, "<div class=\"hint\">暂无保存的网络，连接成功后会自动保存。</div>");
+	} else {
+		for (i = 0; i < count; i++) {
+			char esc_ssid[256], esc_bssid[128], esc_dns1[128], esc_dns2[128];
+
+			html_escape(esc_ssid, sizeof(esc_ssid), items[i].ssid);
+			html_escape(esc_bssid, sizeof(esc_bssid), items[i].bssid);
+			html_escape(esc_dns1, sizeof(esc_dns1), items[i].dns1);
+			html_escape(esc_dns2, sizeof(esc_dns2), items[i].dns2);
+			buf_append(out, outsz,
+				   "<div class=\"saved\"><div><div class=\"v\">%s</div>"
+				   "<div class=\"hint\">BSSID %s · DNS %s / %s%s%s</div></div>"
+				   "<div class=\"savedact\">"
+				   "<form method=\"post\" action=\"/connect_saved\"><input type=\"hidden\" name=\"idx\" value=\"%d\"><button type=\"submit\">连接</button></form>"
+				   "<form method=\"post\" action=\"/forget\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><input type=\"hidden\" name=\"bssid\" value=\"%s\"><button class=\"alt\" type=\"submit\">删除</button></form>"
+				   "</div></div>",
+				   esc_ssid,
+				   esc_bssid[0] ? esc_bssid : "-",
+				   esc_dns1[0] ? esc_dns1 : DEFAULT_DNS1,
+				   esc_dns2[0] ? esc_dns2 : DEFAULT_DNS2,
+				   items[i].hidden ? " · 隐藏" : "",
+				   items[i].route ? " · 默认路由" : "",
+				   i, esc_ssid, esc_bssid);
+		}
+	}
+	buf_append(out, outsz, "</div></section>");
+}
+
 static void render_page(int fd, const struct app_config *cfg,
 			const char *message, const char *scan_text)
 {
@@ -2385,6 +2594,7 @@ static void render_page(int fd, const struct app_config *cfg,
 	char esc_dns[256];
 	char esc_dns_path[512];
 	char *scan_html;
+	char *saved_html;
 	char *body;
 	const char *state_color;
 	const char *state_label;
@@ -2392,9 +2602,11 @@ static void render_page(int fd, const struct app_config *cfg,
 	log_msg(cfg, "render page message=%s scan=%d",
 		message ? message : "", scan_text && *scan_text ? 1 : 0);
 	scan_html = calloc(1, SCAN_HTML_MAX);
+	saved_html = calloc(1, SAVED_HTML_MAX);
 	body = calloc(1, PAGE_BODY_MAX);
-	if (!scan_html || !body) {
+	if (!scan_html || !saved_html || !body) {
 		free(scan_html);
+		free(saved_html);
 		free(body);
 		log_msg(cfg, "render page allocation failed");
 		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
@@ -2413,6 +2625,7 @@ static void render_page(int fd, const struct app_config *cfg,
 	html_escape(esc_dns, sizeof(esc_dns), st.dns);
 	html_escape(esc_dns_path, sizeof(esc_dns_path), cfg->dns_path);
 	build_scan_html(scan_text, scan_html, SCAN_HTML_MAX);
+	build_saved_html(saved_html, SAVED_HTML_MAX);
 
 	state_color = strcmp(st.wpa_state, "COMPLETED") == 0 ? "#257a4b" :
 		      st.engine_running ? "#9b6b13" : "#a34444";
@@ -2437,8 +2650,9 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:600}"
 		 ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:700;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s}button:hover{transform:translateY(-1px);background:#256f43}"
 		 "button.alt,button.scan{background:#fff;color:#2f7d4f}.msg{background:#f0f7f2;border:1px solid #cfe1d4;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px}.tablewrap{overflow:auto}"
+		 ".saved{border:1px solid #edf1ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}"
 		 "table{width:100%%;border-collapse:collapse;font-size:13px}th,td{text-align:left;border-bottom:1px solid #e7ece8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:700}"
-		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}}"
+		 "@media(max-width:760px){.head{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}}"
 		 "</style></head><body><div class=\"bar\"><div class=\"head\"><div><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div><div class=\"pill\">%s</div></div></div><main>"
 		 "%s%s%s"
 		 "<div class=\"summary\">"
@@ -2465,7 +2679,7 @@ static void render_page(int fd, const struct app_config *cfg,
 		 "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
 		 "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
-		 "</div></div></section></div>%s</main></body></html>",
+		 "</div></div></section></div>%s%s</main></body></html>",
 		 state_color,
 		 state_label,
 		 message ? "<section class=\"msg\">" : "",
@@ -2482,10 +2696,12 @@ static void render_page(int fd, const struct app_config *cfg,
 		 esc_dns[0] ? esc_dns : "-",
 		 st.engine_running ? (long)st.engine_pid : 0L,
 		 st.dhcp_running ? (long)st.dhcp_pid : 0L,
+		 saved_html,
 		 scan_html);
 
 	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
 	free(scan_html);
+	free(saved_html);
 	free(body);
 }
 
@@ -2563,33 +2779,23 @@ static int content_length(const char *headers)
 	return 0;
 }
 
-static void handle_connect(int fd, const struct app_config *cfg,
-			   const char *body)
+static void connect_wifi_request(int fd, const struct app_config *cfg,
+				 const char *ssid, const char *psk,
+				 const char *bssid, const char *dns1,
+				 const char *dns2, int hidden, int use_route,
+				 int remember)
 {
-	char ssid[96];
-	char bssid[32];
-	char psk[128];
-	char dns1[64];
-	char dns2[64];
-	char value[16];
-	int hidden;
-	int use_route;
+	char use_dns1[64];
+	char use_dns2[64];
 
-	form_value(body, "ssid", ssid, sizeof(ssid));
-	form_value(body, "bssid", bssid, sizeof(bssid));
-	form_value(body, "psk", psk, sizeof(psk));
-	form_value(body, "dns1", dns1, sizeof(dns1));
-	form_value(body, "dns2", dns2, sizeof(dns2));
-	hidden = form_value(body, "hidden", value, sizeof(value)) && value[0];
-	use_route = form_value(body, "route", value, sizeof(value)) && value[0];
-	if (!dns1[0])
-		snprintf(dns1, sizeof(dns1), "%s", DEFAULT_DNS1);
-	if (!dns2[0])
-		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
+	snprintf(use_dns1, sizeof(use_dns1), "%s",
+		 dns1 && dns1[0] ? dns1 : DEFAULT_DNS1);
+	snprintf(use_dns2, sizeof(use_dns2), "%s",
+		 dns2 && dns2[0] ? dns2 : DEFAULT_DNS2);
 	log_msg(cfg, "connect request ssid=%s bssid=%s hidden=%d route=%d dns1=%s dns2=%s",
-		ssid, bssid, hidden, use_route, dns1, dns2);
+		ssid, bssid ? bssid : "", hidden, use_route, use_dns1, use_dns2);
 
-	if (!valid_ipv4_or_empty(dns1) || !valid_ipv4_or_empty(dns2)) {
+	if (!valid_ipv4_or_empty(use_dns1) || !valid_ipv4_or_empty(use_dns2)) {
 		log_msg(cfg, "connect rejected: invalid dns");
 		render_page(fd, cfg, "DNS 必须是有效的 IPv4 地址。", NULL);
 		return;
@@ -2620,7 +2826,10 @@ static void handle_connect(int fd, const struct app_config *cfg,
 		return;
 	}
 
-	if (start_dhcp(cfg, dns1, dns2, use_route) < 0) {
+	if (remember)
+		remember_wifi(ssid, psk, bssid, use_dns1, use_dns2, hidden, use_route);
+
+	if (start_dhcp(cfg, use_dns1, use_dns2, use_route) < 0) {
 		render_page(fd, cfg, "WiFi 已连接，但 udhcpc 启动失败。", NULL);
 		return;
 	}
@@ -2632,6 +2841,74 @@ static void handle_connect(int fd, const struct app_config *cfg,
 	}
 
 	log_msg(cfg, "connect completed");
+	http_redirect(fd, cfg, "/");
+}
+
+static void handle_connect(int fd, const struct app_config *cfg,
+			   const char *body)
+{
+	char ssid[96];
+	char bssid[32];
+	char psk[128];
+	char dns1[64];
+	char dns2[64];
+	char value[16];
+	int hidden;
+	int use_route;
+
+	form_value(body, "ssid", ssid, sizeof(ssid));
+	form_value(body, "bssid", bssid, sizeof(bssid));
+	form_value(body, "psk", psk, sizeof(psk));
+	form_value(body, "dns1", dns1, sizeof(dns1));
+	form_value(body, "dns2", dns2, sizeof(dns2));
+	hidden = form_value(body, "hidden", value, sizeof(value)) && value[0];
+	use_route = form_value(body, "route", value, sizeof(value)) && value[0];
+	connect_wifi_request(fd, cfg, ssid, psk, bssid, dns1, dns2, hidden,
+			     use_route, 1);
+}
+
+static void handle_connect_saved(int fd, const struct app_config *cfg,
+				 const char *body)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	char value[16];
+	char *end;
+	long parsed;
+	int idx;
+	int count;
+
+	form_value(body, "idx", value, sizeof(value));
+	if (!value[0]) {
+		render_page(fd, cfg, "保存的 WiFi 不存在。", NULL);
+		return;
+	}
+	errno = 0;
+	parsed = strtol(value, &end, 10);
+	if (errno || *end || parsed < 0 || parsed > INT_MAX) {
+		render_page(fd, cfg, "保存的 WiFi 不存在。", NULL);
+		return;
+	}
+	idx = (int)parsed;
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	if (idx < 0 || idx >= count) {
+		render_page(fd, cfg, "保存的 WiFi 不存在。", NULL);
+		return;
+	}
+	connect_wifi_request(fd, cfg, items[idx].ssid, items[idx].psk,
+			     items[idx].bssid, items[idx].dns1, items[idx].dns2,
+			     items[idx].hidden, items[idx].route, 1);
+}
+
+static void handle_forget(int fd, const struct app_config *cfg,
+			  const char *body)
+{
+	char ssid[96];
+	char bssid[32];
+
+	form_value(body, "ssid", ssid, sizeof(ssid));
+	form_value(body, "bssid", bssid, sizeof(bssid));
+	if (ssid[0])
+		forget_wifi(ssid, bssid);
 	http_redirect(fd, cfg, "/");
 }
 
@@ -2776,6 +3053,12 @@ static void handle_client(int fd, const struct app_config *cfg)
 	} else if (strcmp(method, "POST") == 0 &&
 		   strcmp(path, "/connect") == 0) {
 		handle_connect(fd, cfg, body);
+	} else if (strcmp(method, "POST") == 0 &&
+		   strcmp(path, "/connect_saved") == 0) {
+		handle_connect_saved(fd, cfg, body);
+	} else if (strcmp(method, "POST") == 0 &&
+		   strcmp(path, "/forget") == 0) {
+		handle_forget(fd, cfg, body);
 	} else if (strcmp(method, "POST") == 0 &&
 		   strcmp(path, "/disconnect") == 0) {
 		stop_dhcp(cfg);
