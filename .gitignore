@@ -1,13 +1,5 @@
 # Local build products
 /.build/
-*.o
-*.a
-*.la
-*.so
-*.so.*
-
-# Local cross toolchain extracted for this machine
-/cross_toolchain/
 
 # Runtime and test artifacts
 *.log
