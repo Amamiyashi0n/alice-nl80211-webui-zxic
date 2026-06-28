@@ -8,7 +8,9 @@ OUT_DIR := output
 BUILD_DIR := .build
 TARGET := wpa_mini
 TARGET_BIN := $(OUT_DIR)/$(TARGET)
+TARGET_RUN := $(OUT_DIR)/$(TARGET).run
 TARGET_SRC := $(SRC_DIR)/$(TARGET).c
+SELF_EXTRACT := tools/make_self_extract.sh
 WPA_MAIN_OBJ := $(WPA_BUILD)/wpa_supplicant/main.o
 WPA_ENGINE_MAIN_OBJ := $(BUILD_DIR)/wpa_engine_main.o
 WPA_OBJECTS := $(shell find $(WPA_BUILD) -name '*.o' \
@@ -66,7 +68,7 @@ ENGINE_WRAP_LDFLAGS += \
 	-Wl,--wrap=genl_ctrl_resolve
 endif
 
-.PHONY: all clean distclean strip size
+.PHONY: all clean distclean strip size run
 
 all: $(TARGET_BIN)
 
@@ -82,14 +84,20 @@ $(WPA_ENGINE_MAIN_OBJ): $(WPA_MAIN_OBJ) | $(BUILD_DIR)
 $(TARGET_BIN): $(TARGET_SRC) $(WPA_ENGINE_MAIN_OBJ) $(WPA_OBJECTS) | $(OUT_DIR)
 	$(CC) $(CPPFLAGS) $(ENGINE_WRAP_CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(ENGINE_WRAP_LDFLAGS) -o $@ $(TARGET_SRC) $(WPA_ENGINE_MAIN_OBJ) $(WPA_OBJECTS) $(LDLIBS)
 
+$(TARGET_RUN): $(TARGET_BIN) $(SELF_EXTRACT) | $(OUT_DIR)
+	$(SELF_EXTRACT) $(TARGET_BIN) $@
+
 strip: $(TARGET_BIN)
 	$(STRIP) $(TARGET_BIN)
+
+run: $(TARGET_RUN)
 
 size: $(TARGET_BIN)
 	$(CROSS_COMPILE)size $(TARGET_BIN)
 
 clean:
 	rm -f $(TARGET_BIN)
+	rm -f $(TARGET_RUN)
 	rm -f $(OUT_DIR)/wpa_engine_main.o
 	rm -rf $(BUILD_DIR)
 
