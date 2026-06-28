@@ -8,7 +8,7 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `493664` 字节，`wpa_mini.run` 大小为 `342793` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `503152` 字节，`wpa_mini.run` 大小为 `349346` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
 
 ## 功能
 
@@ -27,6 +27,7 @@
 - 开启共享时如果检测到上游 WiFi 和热点/USB 网段冲突，会从 `192.168.0.0/24` 到 `192.168.255.0/24` 自动选择一个未占用网段，并继续开启共享。
 - WebUI 可启用或关闭开机自启动。
 - WebUI 拆分为控制台、网络接口、系统信息三个页面，只读展示目标系统状态、全部网络接口、路由、ARP、监听端口和关键挂载分区。
+- WebUI 和 HTTP 接口内置目标设备侧网络诊断，可测试 STA 网关、DNS UDP 查询、DNS TCP 连接和指定 IPv4 探测；同时包含 raw packet L2 ICMP fallback，不依赖目标系统 busybox `ping`。
 
 默认 WebUI 监听：
 
@@ -159,6 +160,20 @@ curl http://127.0.0.1:51400/interfaces
 ```sh
 curl http://127.0.0.1:51400/system_page
 ```
+
+从目标设备自身发起默认网络诊断：
+
+```sh
+curl http://127.0.0.1:51400/diag
+```
+
+探测指定 IPv4：
+
+```sh
+curl 'http://127.0.0.1:51400/ping?host=223.5.5.5'
+```
+
+目标系统可能会限制普通内核 ICMP/UDP socket，诊断输出中如果看到 `sendto failed errno=1`，优先查看同一目标的 `icmp-l2` 结果；`icmp-l2` 是 `wpa_mini` 自己构造 raw packet 的链路层 ping fallback。
 
 扫描 WiFi：
 

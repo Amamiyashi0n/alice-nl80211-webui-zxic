@@ -3,11 +3,16 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
+#include <net/ethernet.h>
 #include <net/if.h>
+#include <net/if_arp.h>
+#include <netpacket/packet.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +67,7 @@
 #define AUTOSTART_HTML_MAX 6000
 #define SYSTEM_HTML_MAX 42000
 #define SYSTEM_TEXT_MAX 32768
+#define DIAG_TEXT_MAX 12000
 #define PAGE_BODY_MAX 131072
 #define SAVED_WIFI_MAX 8
 #define SYS_IFACE_MAX 32
@@ -70,9 +76,17 @@
 #define SYS_LISTEN_MAX 24
 #define SYS_FS_MAX 8
 #define RELAY_IFACES_TEXT_MAX 128
+#define DIAG_TIMEOUT_MS 1800
+#define ANDROID_AID_INET 3003
+#define ANDROID_AID_NET_RAW 3004
+#define ANDROID_AID_NET_ADMIN 3005
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
+#endif
+
+#ifndef SO_BINDTODEVICE
+#define SO_BINDTODEVICE 25
 #endif
 
 #ifndef ETH_ALEN
@@ -96,6 +110,8 @@ struct app_config {
 static char signal_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 static char engine_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 
+struct runtime_status;
+
 static int mkdir_parent(const char *path);
 static void signal_dnsmasq_reload(const struct app_config *cfg);
 static void stop_relay(const struct app_config *cfg);
@@ -103,6 +119,10 @@ static void set_cloexec(int fd);
 static void close_inherited_fds(void);
 static void refresh_usb_bridge_members(const struct app_config *cfg,
 				       const char *bridge);
+static void get_runtime_status(const struct app_config *cfg,
+			       struct runtime_status *st);
+static void read_dns_pair(const char *path, char *dns1, size_t dns1sz,
+			  char *dns2, size_t dns2sz);
 
 typedef void (*wpa_msg_cb_func)(void *ctx, int level, int global,
 				const char *txt, size_t len);
@@ -943,6 +963,24 @@ static void install_signal_handlers(const struct app_config *cfg)
 	sigaction(SIGTERM, &sa, NULL);
 }
 
+static void ensure_network_groups(const struct app_config *cfg)
+{
+	gid_t groups[] = {
+		ANDROID_AID_INET,
+		ANDROID_AID_NET_RAW,
+		ANDROID_AID_NET_ADMIN,
+	};
+
+	if (geteuid() != 0)
+		return;
+	if (setgroups(sizeof(groups) / sizeof(groups[0]), groups) == 0)
+		log_msg(cfg, "network groups set inet=%d net_raw=%d net_admin=%d",
+			ANDROID_AID_INET, ANDROID_AID_NET_RAW,
+			ANDROID_AID_NET_ADMIN);
+	else
+		log_msg(cfg, "network groups set failed errno=%d", errno);
+}
+
 static void buf_append(char *buf, size_t bufsz, const char *fmt, ...)
 {
 	va_list ap;
@@ -1041,6 +1079,13 @@ static int valid_ipv4_or_empty(const char *s)
 	if (!s || !*s)
 		return 1;
 	return inet_pton(AF_INET, s, &a) == 1;
+}
+
+static int valid_ipv4(const char *s)
+{
+	struct in_addr a;
+
+	return s && *s && inet_pton(AF_INET, s, &a) == 1;
 }
 
 static void write_quoted(FILE *fp, const char *s)
@@ -2534,6 +2579,25 @@ static int read_iface_ipv4(const char *iface, char *out, size_t outsz)
 	return 0;
 }
 
+static int read_iface_mac(const char *iface, unsigned char mac[ETH_ALEN])
+{
+	int fd;
+	struct ifreq ifr;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	memcpy(mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	return 0;
+}
+
 static int wait_ipv4_ready(const struct app_config *cfg, int timeout_ms)
 {
 	int elapsed = 0;
@@ -2793,6 +2857,21 @@ static int iface_has_default_route(const char *iface)
 	}
 	fclose(fp);
 	return found;
+}
+
+static int wait_default_route_ready(const struct app_config *cfg,
+				    int timeout_ms)
+{
+	int elapsed = 0;
+
+	while (elapsed < timeout_ms) {
+		if (iface_has_default_route(cfg->iface))
+			return 0;
+		usleep(250000);
+		elapsed += 250;
+	}
+
+	return -1;
 }
 
 static int subnet_conflicts_addr(uint32_t net_host)
@@ -3544,6 +3623,761 @@ static int read_gateway(const char *iface, char *out, size_t outsz)
 
 	fclose(fp);
 	return -1;
+}
+
+static unsigned short diag_checksum(const void *data, size_t len)
+{
+	const unsigned char *p = data;
+	unsigned long sum = 0;
+
+	while (len > 1) {
+		sum += (unsigned short)((p[0] << 8) | p[1]);
+		p += 2;
+		len -= 2;
+	}
+	if (len)
+		sum += (unsigned short)(p[0] << 8);
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (unsigned short)(~sum);
+}
+
+static int set_nonblock(int fd, int enable)
+{
+	int flags = fcntl(fd, F_GETFL, 0);
+
+	if (flags < 0)
+		return -1;
+	if (enable)
+		flags |= O_NONBLOCK;
+	else
+		flags &= ~O_NONBLOCK;
+	return fcntl(fd, F_SETFL, flags);
+}
+
+static int bind_socket_ip(int fd, const char *ip, char *detail,
+			  size_t detailsz)
+{
+	struct sockaddr_in local;
+
+	if (!ip || !*ip)
+		return 0;
+	memset(&local, 0, sizeof(local));
+	local.sin_family = AF_INET;
+	if (inet_pton(AF_INET, ip, &local.sin_addr) != 1)
+		return 0;
+	if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+		snprintf(detail, detailsz, "bind %s failed errno=%d", ip, errno);
+		return -1;
+	}
+	return 0;
+}
+
+static int bind_socket_device(int fd, const char *iface, char *detail,
+			      size_t detailsz)
+{
+	if (!iface || !*iface)
+		return 0;
+	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface,
+		       strlen(iface) + 1) < 0) {
+		snprintf(detail, detailsz, "bind device %s failed errno=%d",
+			 iface, errno);
+		return -1;
+	}
+	return 0;
+}
+
+static int bind_diag_socket(int fd, const char *src_ip, const char *iface,
+			    int bind_mode, char *detail, size_t detailsz)
+{
+	if (bind_mode == 1)
+		return bind_socket_ip(fd, src_ip, detail, detailsz);
+	if (bind_mode == 2)
+		return bind_socket_device(fd, iface, detail, detailsz);
+	return 0;
+}
+
+static int parse_mac_addr(const char *s, unsigned char mac[ETH_ALEN])
+{
+	unsigned int v[ETH_ALEN];
+	int i;
+
+	if (sscanf(s, "%x:%x:%x:%x:%x:%x",
+		   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+		return -1;
+	for (i = 0; i < ETH_ALEN; i++) {
+		if (v[i] > 255)
+			return -1;
+		mac[i] = (unsigned char)v[i];
+	}
+	return 0;
+}
+
+static void put16(unsigned char *p, unsigned short v)
+{
+	p[0] = (unsigned char)(v >> 8);
+	p[1] = (unsigned char)(v & 0xff);
+}
+
+static int read_arp_mac(const char *ip, const char *iface,
+			unsigned char mac[ETH_ALEN])
+{
+	FILE *fp;
+	char line[256];
+
+	fp = fopen("/proc/net/arp", "r");
+	if (!fp)
+		return -1;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return -1;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		char addr[64], hw[16], flags[16], macs[32], mask[32], dev[IFNAMSIZ];
+
+		if (sscanf(line, "%63s %15s %15s %31s %31s %15s",
+			   addr, hw, flags, macs, mask, dev) != 6)
+			continue;
+		if (strcmp(addr, ip) != 0 || strcmp(dev, iface) != 0)
+			continue;
+		if (parse_mac_addr(macs, mac) == 0) {
+			fclose(fp);
+			return 0;
+		}
+	}
+	fclose(fp);
+	return -1;
+}
+
+static int resolve_arp_mac_l2(const char *target_ip, const char *src_ip,
+			      const char *iface, unsigned char mac[ETH_ALEN],
+			      int timeout_ms, char *detail, size_t detailsz)
+{
+	unsigned char src_mac[ETH_ALEN];
+	unsigned char frame[42];
+	unsigned char recvbuf[1600];
+	unsigned char bcast[ETH_ALEN];
+	struct sockaddr_ll addr;
+	struct in_addr target_addr;
+	struct in_addr src_addr;
+	long long start;
+	fd_set rfds;
+	struct timeval tv;
+	int ifindex;
+	int fd;
+	ssize_t n;
+
+	memset(bcast, 0xff, sizeof(bcast));
+	if (!valid_ipv4(target_ip) || !valid_ipv4(src_ip) || !iface || !*iface) {
+		snprintf(detail, detailsz, "arp missing ipv4/iface");
+		return -1;
+	}
+	if (inet_pton(AF_INET, target_ip, &target_addr) != 1 ||
+	    inet_pton(AF_INET, src_ip, &src_addr) != 1) {
+		snprintf(detail, detailsz, "arp invalid address");
+		return -1;
+	}
+	if (read_iface_mac(iface, src_mac) < 0) {
+		snprintf(detail, detailsz, "arp read iface mac failed errno=%d",
+			 errno);
+		return -1;
+	}
+	ifindex = if_nametoindex(iface);
+	if (!ifindex) {
+		snprintf(detail, detailsz, "arp if_nametoindex failed errno=%d",
+			 errno);
+		return -1;
+	}
+	fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+	if (fd < 0) {
+		snprintf(detail, detailsz, "arp packet socket failed errno=%d",
+			 errno);
+		return -1;
+	}
+
+	memset(frame, 0, sizeof(frame));
+	memcpy(frame, bcast, ETH_ALEN);
+	memcpy(frame + 6, src_mac, ETH_ALEN);
+	put16(frame + 12, ETH_P_ARP);
+	put16(frame + 14, ARPHRD_ETHER);
+	put16(frame + 16, ETH_P_IP);
+	frame[18] = ETH_ALEN;
+	frame[19] = 4;
+	put16(frame + 20, ARPOP_REQUEST);
+	memcpy(frame + 22, src_mac, ETH_ALEN);
+	memcpy(frame + 28, &src_addr.s_addr, 4);
+	memcpy(frame + 38, &target_addr.s_addr, 4);
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sll_family = AF_PACKET;
+	addr.sll_protocol = htons(ETH_P_ARP);
+	addr.sll_ifindex = ifindex;
+	addr.sll_halen = ETH_ALEN;
+	memcpy(addr.sll_addr, bcast, ETH_ALEN);
+
+	start = now_ms();
+	if (sendto(fd, frame, sizeof(frame), 0,
+		   (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		snprintf(detail, detailsz, "arp sendto failed errno=%d", errno);
+		close(fd);
+		return -1;
+	}
+	while (now_ms() - start < timeout_ms) {
+		long long left = timeout_ms - (now_ms() - start);
+		if (left < 0)
+			left = 0;
+		FD_ZERO(&rfds);
+		FD_SET(fd, &rfds);
+		tv.tv_sec = (int)(left / 1000);
+		tv.tv_usec = (int)((left % 1000) * 1000);
+		if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0)
+			break;
+		n = recvfrom(fd, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
+		if (n < 42)
+			continue;
+		if (recvbuf[12] != 0x08 || recvbuf[13] != 0x06)
+			continue;
+		if (recvbuf[20] != 0 || recvbuf[21] != ARPOP_REPLY)
+			continue;
+		if (memcmp(recvbuf + 28, &target_addr.s_addr, 4) != 0)
+			continue;
+		memcpy(mac, recvbuf + 22, ETH_ALEN);
+		close(fd);
+		return 0;
+	}
+	snprintf(detail, detailsz, "arp timeout for %s", target_ip);
+	close(fd);
+	return -1;
+}
+
+static int diag_l2_icmp_ping_ip(const char *dst_ip, const char *src_ip,
+				const char *gateway_ip, const char *iface,
+				int timeout_ms, char *detail, size_t detailsz)
+{
+	unsigned char src_mac[ETH_ALEN];
+	unsigned char dst_mac[ETH_ALEN];
+	unsigned char frame[14 + 20 + 8 + 16];
+	unsigned char recvbuf[1600];
+	struct sockaddr_ll addr;
+	struct in_addr dst_addr;
+	struct in_addr src_addr;
+	struct in_addr gw_addr;
+	struct in_addr dst_net;
+	struct in_addr src_net;
+	struct in_addr mask;
+	const char *next_hop;
+	unsigned short ip_len = 20 + 8 + 16;
+	unsigned short id;
+	long long start;
+	fd_set rfds;
+	struct timeval tv;
+	int ifindex;
+	int fd;
+	ssize_t n;
+
+	if (!detail || !detailsz)
+		return -1;
+	detail[0] = '\0';
+	if (!valid_ipv4(dst_ip) || !valid_ipv4(src_ip) || !iface || !*iface) {
+		snprintf(detail, detailsz, "missing ipv4/iface");
+		return -1;
+	}
+	if (inet_pton(AF_INET, dst_ip, &dst_addr) != 1 ||
+	    inet_pton(AF_INET, src_ip, &src_addr) != 1) {
+		snprintf(detail, detailsz, "invalid address");
+		return -1;
+	}
+	next_hop = dst_ip;
+	if (read_iface_ipv4_net(iface, &src_net, &mask) == 0) {
+		dst_net.s_addr = dst_addr.s_addr & mask.s_addr;
+		src_net.s_addr &= mask.s_addr;
+		if (dst_net.s_addr != src_net.s_addr && gateway_ip &&
+		    inet_pton(AF_INET, gateway_ip, &gw_addr) == 1)
+			next_hop = gateway_ip;
+	}
+	if (read_iface_mac(iface, src_mac) < 0) {
+		snprintf(detail, detailsz, "read iface mac failed errno=%d", errno);
+		return -1;
+	}
+	if (read_arp_mac(next_hop, iface, dst_mac) < 0 &&
+	    resolve_arp_mac_l2(next_hop, src_ip, iface, dst_mac, timeout_ms,
+			       detail, detailsz) < 0)
+		return -1;
+	ifindex = if_nametoindex(iface);
+	if (!ifindex) {
+		snprintf(detail, detailsz, "if_nametoindex failed errno=%d", errno);
+		return -1;
+	}
+	fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+	if (fd < 0) {
+		snprintf(detail, detailsz, "packet socket failed errno=%d", errno);
+		return -1;
+	}
+
+	memset(frame, 0, sizeof(frame));
+	memcpy(frame, dst_mac, ETH_ALEN);
+	memcpy(frame + 6, src_mac, ETH_ALEN);
+	put16(frame + 12, ETH_P_IP);
+	frame[14] = 0x45;
+	frame[15] = 0;
+	put16(frame + 16, ip_len);
+	id = (unsigned short)(getpid() & 0xffff);
+	put16(frame + 18, id);
+	put16(frame + 20, 0);
+	frame[22] = 64;
+	frame[23] = IPPROTO_ICMP;
+	memcpy(frame + 26, &src_addr.s_addr, 4);
+	memcpy(frame + 30, &dst_addr.s_addr, 4);
+	put16(frame + 24, diag_checksum(frame + 14, 20));
+	frame[34] = 8;
+	frame[35] = 0;
+	put16(frame + 38, id);
+	put16(frame + 40, 1);
+	memcpy(frame + 42, "wpa_mini_diag", 13);
+	put16(frame + 36, diag_checksum(frame + 34, 8 + 16));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sll_family = AF_PACKET;
+	addr.sll_protocol = htons(ETH_P_IP);
+	addr.sll_ifindex = ifindex;
+	addr.sll_halen = ETH_ALEN;
+	memcpy(addr.sll_addr, dst_mac, ETH_ALEN);
+
+	start = now_ms();
+	if (sendto(fd, frame, sizeof(frame), 0,
+		   (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		snprintf(detail, detailsz, "packet sendto failed errno=%d", errno);
+		close(fd);
+		return -1;
+	}
+	while (now_ms() - start < timeout_ms) {
+		long long left = timeout_ms - (now_ms() - start);
+		if (left < 0)
+			left = 0;
+		FD_ZERO(&rfds);
+		FD_SET(fd, &rfds);
+		tv.tv_sec = (int)(left / 1000);
+		tv.tv_usec = (int)((left % 1000) * 1000);
+		if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0)
+			break;
+		n = recvfrom(fd, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
+		if (n < 42)
+			continue;
+		if (recvbuf[12] != 0x08 || recvbuf[13] != 0x00)
+			continue;
+		if (recvbuf[23] != IPPROTO_ICMP || recvbuf[34] != 0)
+			continue;
+		if ((unsigned short)((recvbuf[38] << 8) | recvbuf[39]) != id)
+			continue;
+		snprintf(detail, detailsz, "l2 icmp reply in %lld ms via %s",
+			 now_ms() - start, next_hop);
+		close(fd);
+		return 0;
+	}
+	snprintf(detail, detailsz, "l2 icmp timeout via %s", next_hop);
+	close(fd);
+	return -1;
+}
+
+static int diag_tcp_connect_ip(const char *dst_ip, int port,
+			       const char *src_ip, const char *iface,
+			       int bind_mode, int timeout_ms,
+			       char *detail, size_t detailsz)
+{
+	struct sockaddr_in dst;
+	struct timeval tv;
+	fd_set wfds;
+	long long start;
+	int fd;
+	int err = 0;
+	socklen_t errlen = sizeof(err);
+
+	if (!detail || !detailsz)
+		return -1;
+	detail[0] = '\0';
+	if (!valid_ipv4(dst_ip)) {
+		snprintf(detail, detailsz, "invalid ipv4");
+		return -1;
+	}
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		snprintf(detail, detailsz, "socket failed errno=%d", errno);
+		return -1;
+	}
+	if (bind_diag_socket(fd, src_ip, iface, bind_mode,
+			     detail, detailsz) < 0) {
+		close(fd);
+		return -1;
+	}
+	set_nonblock(fd, 1);
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family = AF_INET;
+	dst.sin_port = htons((unsigned short)port);
+	inet_pton(AF_INET, dst_ip, &dst.sin_addr);
+
+	start = now_ms();
+	if (connect(fd, (struct sockaddr *)&dst, sizeof(dst)) == 0) {
+		snprintf(detail, detailsz, "connected in %lld ms",
+			 now_ms() - start);
+		close(fd);
+		return 0;
+	}
+	if (errno != EINPROGRESS) {
+		snprintf(detail, detailsz, "connect failed errno=%d", errno);
+		close(fd);
+		return -1;
+	}
+
+	FD_ZERO(&wfds);
+	FD_SET(fd, &wfds);
+	tv.tv_sec = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
+	if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
+		snprintf(detail, detailsz, "timeout after %d ms", timeout_ms);
+		close(fd);
+		return -1;
+	}
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0)
+		err = errno;
+	if (err) {
+		snprintf(detail, detailsz, "connect error=%d", err);
+		close(fd);
+		return -1;
+	}
+	snprintf(detail, detailsz, "connected in %lld ms", now_ms() - start);
+	close(fd);
+	return 0;
+}
+
+static size_t diag_dns_name(unsigned char *buf, size_t bufsz,
+			    const char *name)
+{
+	size_t used = 0;
+	const char *p = name;
+
+	while (*p) {
+		const char *dot = strchr(p, '.');
+		size_t len = dot ? (size_t)(dot - p) : strlen(p);
+
+		if (!len || len > 63 || used + len + 1 >= bufsz)
+			return 0;
+		buf[used++] = (unsigned char)len;
+		memcpy(buf + used, p, len);
+		used += len;
+		if (!dot)
+			break;
+		p = dot + 1;
+	}
+	if (used + 1 >= bufsz)
+		return 0;
+	buf[used++] = 0;
+	return used;
+}
+
+static int diag_udp_dns_query(const char *dns_ip, const char *src_ip,
+			      const char *iface, int bind_mode,
+			      int timeout_ms, char *detail, size_t detailsz)
+{
+	unsigned char q[128];
+	unsigned char r[512];
+	struct sockaddr_in dst;
+	struct timeval tv;
+	fd_set rfds;
+	long long start;
+	size_t pos;
+	ssize_t n;
+	int fd;
+
+	if (!detail || !detailsz)
+		return -1;
+	detail[0] = '\0';
+	if (!valid_ipv4(dns_ip)) {
+		snprintf(detail, detailsz, "invalid dns ipv4");
+		return -1;
+	}
+	memset(q, 0, sizeof(q));
+	q[0] = 0x4d;
+	q[1] = 0x50;
+	q[2] = 0x01;
+	q[5] = 0x01;
+	pos = 12;
+	n = (ssize_t)diag_dns_name(q + pos, sizeof(q) - pos - 4,
+				   "www.qq.com");
+	if (n <= 0) {
+		snprintf(detail, detailsz, "build query failed");
+		return -1;
+	}
+	pos += (size_t)n;
+	q[pos++] = 0;
+	q[pos++] = 1;
+	q[pos++] = 0;
+	q[pos++] = 1;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		snprintf(detail, detailsz, "socket failed errno=%d", errno);
+		return -1;
+	}
+	if (bind_diag_socket(fd, src_ip, iface, bind_mode,
+			     detail, detailsz) < 0) {
+		close(fd);
+		return -1;
+	}
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family = AF_INET;
+	dst.sin_port = htons(53);
+	inet_pton(AF_INET, dns_ip, &dst.sin_addr);
+
+	start = now_ms();
+	if (sendto(fd, q, pos, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		snprintf(detail, detailsz, "sendto failed errno=%d", errno);
+		close(fd);
+		return -1;
+	}
+	FD_ZERO(&rfds);
+	FD_SET(fd, &rfds);
+	tv.tv_sec = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
+	if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+		snprintf(detail, detailsz, "timeout after %d ms", timeout_ms);
+		close(fd);
+		return -1;
+	}
+	n = recvfrom(fd, r, sizeof(r), 0, NULL, NULL);
+	if (n < 12) {
+		snprintf(detail, detailsz, "short response %ld", (long)n);
+		close(fd);
+		return -1;
+	}
+	if (r[0] != q[0] || r[1] != q[1]) {
+		snprintf(detail, detailsz, "unexpected dns id");
+		close(fd);
+		return -1;
+	}
+	snprintf(detail, detailsz, "dns response %ld bytes in %lld ms",
+		 (long)n, now_ms() - start);
+	close(fd);
+	return 0;
+}
+
+static int diag_icmp_ping_ip(const char *dst_ip, const char *src_ip,
+			     const char *iface, int bind_mode,
+			     int timeout_ms, char *detail, size_t detailsz)
+{
+	struct {
+		unsigned char type;
+		unsigned char code;
+		unsigned short checksum;
+		unsigned short id;
+		unsigned short seq;
+		unsigned char data[16];
+	} req;
+	unsigned char recvbuf[256];
+	struct sockaddr_in dst;
+	struct timeval tv;
+	fd_set rfds;
+	long long start;
+	ssize_t n;
+	int fd;
+	unsigned short id;
+
+	if (!detail || !detailsz)
+		return -1;
+	detail[0] = '\0';
+	if (!valid_ipv4(dst_ip)) {
+		snprintf(detail, detailsz, "invalid ipv4");
+		return -1;
+	}
+	fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (fd < 0) {
+		snprintf(detail, detailsz, "raw icmp unavailable errno=%d", errno);
+		return -1;
+	}
+	if (bind_diag_socket(fd, src_ip, iface, bind_mode,
+			     detail, detailsz) < 0) {
+		close(fd);
+		return -1;
+	}
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family = AF_INET;
+	inet_pton(AF_INET, dst_ip, &dst.sin_addr);
+
+	memset(&req, 0, sizeof(req));
+	req.type = 8;
+	id = (unsigned short)(getpid() & 0xffff);
+	req.id = htons(id);
+	req.seq = htons(1);
+	memcpy(req.data, "wpa_mini_diag", 13);
+	req.checksum = htons(diag_checksum(&req, sizeof(req)));
+
+	start = now_ms();
+	if (sendto(fd, &req, sizeof(req), 0,
+		   (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		snprintf(detail, detailsz, "sendto failed errno=%d", errno);
+		close(fd);
+		return -1;
+	}
+	FD_ZERO(&rfds);
+	FD_SET(fd, &rfds);
+	tv.tv_sec = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
+	if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+		snprintf(detail, detailsz, "timeout after %d ms", timeout_ms);
+		close(fd);
+		return -1;
+	}
+	n = recvfrom(fd, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
+	if (n < 28) {
+		snprintf(detail, detailsz, "short response %ld", (long)n);
+		close(fd);
+		return -1;
+	}
+	if ((recvbuf[0] >> 4) == 4) {
+		size_t ihl = (size_t)(recvbuf[0] & 0x0f) * 4;
+		if ((size_t)n >= ihl + 8 && recvbuf[ihl] == 0 &&
+		    (unsigned short)((recvbuf[ihl + 4] << 8) |
+				     recvbuf[ihl + 5]) == id) {
+			snprintf(detail, detailsz, "icmp reply in %lld ms",
+				 now_ms() - start);
+			close(fd);
+			return 0;
+		}
+	}
+	snprintf(detail, detailsz, "unexpected icmp response %ld bytes", (long)n);
+	close(fd);
+	return -1;
+}
+
+static void append_diag_probe(char *out, size_t outsz, const char *name,
+			      const char *target, int ok, const char *detail)
+{
+	buf_append(out, outsz, "%s %s %s - %s\n",
+		   ok ? "[OK]" : "[FAIL]", name, target ? target : "",
+		   detail && *detail ? detail : "-");
+}
+
+static const char *diag_bind_label(int bind_mode)
+{
+	if (bind_mode == 1)
+		return "src-ip";
+	if (bind_mode == 2)
+		return "device";
+	return "auto";
+}
+
+static void append_diag_target(char *out, size_t outsz,
+			       const char *label, const char *target,
+			       const char *src_ip, const char *iface,
+			       const char *gateway_ip, int bind_mode,
+			       int include_dns)
+{
+	char detail[192];
+	char name[64];
+
+	snprintf(name, sizeof(name), "%s icmp/%s", label,
+		 diag_bind_label(bind_mode));
+	append_diag_probe(out, outsz, name, target,
+			  diag_icmp_ping_ip(target, src_ip, iface, bind_mode,
+					    DIAG_TIMEOUT_MS, detail,
+					    sizeof(detail)) == 0,
+			  detail);
+	if (bind_mode == 0) {
+		snprintf(name, sizeof(name), "%s icmp-l2", label);
+		append_diag_probe(out, outsz, name, target,
+				  diag_l2_icmp_ping_ip(target, src_ip,
+						       gateway_ip, iface,
+						       DIAG_TIMEOUT_MS,
+						       detail,
+						       sizeof(detail)) == 0,
+				  detail);
+	}
+	snprintf(name, sizeof(name), "%s tcp53/%s", label,
+		 diag_bind_label(bind_mode));
+	append_diag_probe(out, outsz, name, target,
+			  diag_tcp_connect_ip(target, 53, src_ip, iface,
+					      bind_mode, DIAG_TIMEOUT_MS,
+					      detail, sizeof(detail)) == 0,
+			  detail);
+	if (!include_dns)
+		return;
+	snprintf(name, sizeof(name), "%s dnsudp/%s", label,
+		 diag_bind_label(bind_mode));
+	append_diag_probe(out, outsz, name, target,
+			  diag_udp_dns_query(target, src_ip, iface, bind_mode,
+					     DIAG_TIMEOUT_MS, detail,
+					     sizeof(detail)) == 0,
+			  detail);
+}
+
+static void build_diag_text(const struct app_config *cfg, const char *target,
+			    char *out, size_t outsz)
+{
+	struct runtime_status st;
+	char dns1[64];
+	char dns2[64];
+	const char *src_ip;
+	int single;
+
+	if (outsz)
+		out[0] = '\0';
+	get_runtime_status(cfg, &st);
+	read_dns_pair(cfg->dns_path, dns1, sizeof(dns1), dns2, sizeof(dns2));
+	if (!dns1[0])
+		snprintf(dns1, sizeof(dns1), "%s", DEFAULT_DNS1);
+	if (!dns2[0])
+		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
+	src_ip = st.ip[0] ? st.ip : NULL;
+	single = target && *target;
+
+	buf_append(out, outsz, "wpa_mini network diagnostics\n");
+	buf_append(out, outsz, "iface=%s state=%s ssid=%s ip=%s gateway=%s dns=%s,%s\n",
+		   cfg->iface, st.wpa_state, st.ssid[0] ? st.ssid : "-",
+		   st.ip[0] ? st.ip : "-", st.gateway[0] ? st.gateway : "-",
+		   dns1, dns2);
+	buf_append(out, outsz, "default_route=%s relay=%s lan=%s wan=%s\n\n",
+		   st.default_route_ready ? "ready" : "missing",
+		   st.relay_enabled ? "enabled" : "disabled",
+		   st.relay_lan_subnet[0] ? st.relay_lan_subnet : "-",
+		   st.relay_wan_iface[0] ? st.relay_wan_iface : cfg->iface);
+
+	if (single) {
+		if (!valid_ipv4(target)) {
+			buf_append(out, outsz, "[FAIL] target %s - invalid ipv4\n",
+				   target);
+			return;
+		}
+		append_diag_target(out, outsz, "target", target,
+				   src_ip, cfg->iface, st.gateway, 0, 1);
+		append_diag_target(out, outsz, "target", target,
+				   src_ip, cfg->iface, st.gateway, 1, 1);
+		append_diag_target(out, outsz, "target", target,
+				   src_ip, cfg->iface, st.gateway, 2, 1);
+		return;
+	}
+
+	if (st.gateway[0]) {
+		append_diag_target(out, outsz, "gateway", st.gateway,
+				   src_ip, cfg->iface, st.gateway, 0, 0);
+		append_diag_target(out, outsz, "gateway", st.gateway,
+				   src_ip, cfg->iface, st.gateway, 1, 0);
+		append_diag_target(out, outsz, "gateway", st.gateway,
+				   src_ip, cfg->iface, st.gateway, 2, 0);
+	} else {
+		buf_append(out, outsz, "[FAIL] gateway - no default gateway on %s\n",
+			   cfg->iface);
+	}
+	append_diag_target(out, outsz, "dns1", dns1,
+			   src_ip, cfg->iface, st.gateway, 0, 1);
+	append_diag_target(out, outsz, "dns1", dns1,
+			   src_ip, cfg->iface, st.gateway, 1, 1);
+	append_diag_target(out, outsz, "dns1", dns1,
+			   src_ip, cfg->iface, st.gateway, 2, 1);
+	append_diag_target(out, outsz, "dns2", dns2,
+			   src_ip, cfg->iface, st.gateway, 0, 1);
+	append_diag_target(out, outsz, "dns2", dns2,
+			   src_ip, cfg->iface, st.gateway, 1, 1);
+	append_diag_target(out, outsz, "dns2", dns2,
+			   src_ip, cfg->iface, st.gateway, 2, 1);
 }
 
 static void read_dns_file(const char *path, char *out, size_t outsz)
@@ -4491,6 +5325,26 @@ static void append_system_overview_html(const struct system_snapshot *snap,
 		   esc);
 }
 
+static void append_diag_html(char *out, size_t outsz)
+{
+	buf_append(out, outsz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">网络诊断</div>"
+		   "<div class=\"hint\">从目标设备自身发起探测，用于判断 WiFi 出口是否可用</div>"
+		   "</div><a class=\"tinylink\" href=\"/diag\">文本诊断</a>"
+		   "</div><div class=\"pad\">"
+		   "<div class=\"actions\">"
+		   "<a class=\"tinylink\" href=\"/diag\">运行默认诊断</a>"
+		   "</div>"
+		   "<form method=\"get\" action=\"/ping\">"
+		   "<label>目标 IPv4</label>"
+		   "<div class=\"twocol\"><input name=\"host\" value=\"223.5.5.5\" inputmode=\"decimal\">"
+		   "<button type=\"submit\">探测目标</button></div>"
+		   "</form>"
+		   "<div class=\"hint\">默认诊断会测试网关、阿里 DNS 和腾讯 DNS；如果原始 ICMP 被系统禁止，会继续显示 TCP/UDP 结果。</div>"
+		   "</div></section>");
+}
+
 static void append_interfaces_html(const struct system_snapshot *snap,
 				   char *out, size_t outsz)
 {
@@ -4662,6 +5516,7 @@ static void build_system_page_html(const struct app_config *cfg, char *out,
 		out[0] = '\0';
 	collect_system_snapshot(cfg, &snap);
 	append_system_overview_html(&snap, out, outsz);
+	append_diag_html(out, outsz);
 	append_services_mounts_html(&snap, out, outsz);
 }
 
@@ -5124,6 +5979,23 @@ static void render_system(int fd, const struct app_config *cfg)
 	free(body);
 }
 
+static void render_diag(int fd, const struct app_config *cfg,
+			const char *target)
+{
+	char *body;
+
+	log_msg(cfg, "render diag target=%s", target ? target : "");
+	body = calloc(1, DIAG_TEXT_MAX);
+	if (!body) {
+		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
+			  "out of memory\n");
+		return;
+	}
+	build_diag_text(cfg, target, body, DIAG_TEXT_MAX);
+	http_send(fd, cfg, 200, "OK", "text/plain; charset=utf-8", body);
+	free(body);
+}
+
 static int content_length(const char *headers)
 {
 	const char *p = headers;
@@ -5220,6 +6092,11 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 	if (wait_ipv4_ready(cfg, 8000) < 0) {
 		log_msg(cfg, "connect warning: DHCP no IP yet");
 		render_page(fd, cfg, "WiFi 已连接，但 DHCP 暂未分配 IP。", NULL);
+		return;
+	}
+	if (use_route && wait_default_route_ready(cfg, 5000) < 0) {
+		log_msg(cfg, "connect warning: default route not ready");
+		render_page(fd, cfg, "WiFi 已连接，但默认网关尚未就绪。", NULL);
 		return;
 	}
 
@@ -5444,7 +6321,8 @@ static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
 
 	stop_dhcp(cfg);
 	if (start_dhcp(cfg, DEFAULT_DNS1, DEFAULT_DNS2, 1) < 0 ||
-	    wait_ipv4_ready(cfg, 8000) < 0) {
+	    wait_ipv4_ready(cfg, 8000) < 0 ||
+	    wait_default_route_ready(cfg, 5000) < 0) {
 		render_page(fd, cfg,
 			    "热点/USB 网段已调整，但 WiFi 出口 DHCP 还没有恢复。",
 			    NULL);
@@ -5475,6 +6353,7 @@ static void handle_client(int fd, const struct app_config *cfg)
 	char *header_end;
 	char *body;
 	char *query;
+	char *query_params;
 	int total = 0;
 	int need;
 	int clen;
@@ -5552,8 +6431,11 @@ static void handle_client(int fd, const struct app_config *cfg)
 	}
 	body = header_end + 4;
 	query = strchr(path, '?');
-	if (query)
+	query_params = NULL;
+	if (query) {
+		query_params = query + 1;
 		*query = '\0';
+	}
 
 	log_msg(cfg, "http request method=%s path=%s body=%d",
 		method, path, clen);
@@ -5570,6 +6452,13 @@ static void handle_client(int fd, const struct app_config *cfg)
 		render_status(fd, cfg);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/system") == 0) {
 		render_system(fd, cfg);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/diag") == 0) {
+		render_diag(fd, cfg, NULL);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/ping") == 0) {
+		char host[64];
+		form_value(query_params ? query_params : "", "host",
+			   host, sizeof(host));
+		render_diag(fd, cfg, host);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/scan") == 0) {
 		handle_scan_text(fd, cfg);
 	} else if (strcmp(method, "POST") == 0 &&
@@ -5766,6 +6655,7 @@ int main(int argc, char **argv)
 	}
 
 	install_signal_handlers(&cfg);
+	ensure_network_groups(&cfg);
 	log_msg(&cfg, "main start argc=%d iface=%s port=%d web=%d",
 		argc, cfg.iface, cfg.port, web);
 
@@ -5824,6 +6714,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "warning: failed to start udhcpc\n");
 	else if (wait_ipv4_ready(&cfg, 8000) < 0)
 		fprintf(stderr, "warning: DHCP has not assigned an IP yet\n");
+	else if (use_default_route &&
+		 wait_default_route_ready(&cfg, 5000) < 0)
+		fprintf(stderr, "warning: default route is not ready yet\n");
 	else if (relay && start_relay(&cfg, DEFAULT_DNS1, DEFAULT_DNS2) < 0)
 		fprintf(stderr, "warning: failed to enable WiFi relay/NAT\n");
 
