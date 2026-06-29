@@ -8,7 +8,7 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `503152` 字节，`wpa_mini.run` 大小为 `349346` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `508016` 字节，`wpa_mini.run` 大小为 `352734` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
 
 ## 功能
 
@@ -24,6 +24,7 @@
 - 默认让本设备通过连接的 WiFi STA 出网。
 - 可选共享网络给热点和 USB 设备：下层 `br0` 网络中的 WiFi AP 客户端和 USB/RNDIS 客户端通过 `wlan0-vxd` 出网，连接后也可单独开启或关闭。
 - 开启共享时，下层 DHCP 会直接下发当前 DNS，默认是阿里 `223.5.5.5` 和腾讯 `119.29.29.29`。
+- 开启共享时只向下层客户端提供普通网关和 DNS，不强制抢占客户端已有更高优先级网络。
 - 开启共享时如果检测到上游 WiFi 和热点/USB 网段冲突，会从 `192.168.0.0/24` 到 `192.168.255.0/24` 自动选择一个未占用网段，并继续开启共享。
 - WebUI 可启用或关闭开机自启动。
 - WebUI 拆分为控制台、网络接口、系统信息三个页面，只读展示目标系统状态、全部网络接口、路由、ARP、监听端口和关键挂载分区。
@@ -337,6 +338,8 @@ nameserver 119.29.29.29
 - 添加 `iptables` NAT：`br0` 下层网段经 `wlan0-vxd` 做 `MASQUERADE`。
 - 尝试添加 `br0` 以及 `br0` 成员接口的 FORWARD 放行规则，覆盖 `usblan0`、`wlan0` 等下层接口；若系统默认已放行，规则失败只记录日志。
 - 确保 `/etc_rw/udhcpd.conf` 与当前 `br0` 网段一致，并启动 `udhcpd`，让 USB/RNDIS 和热点客户端能自动获取 IP、网关和当前 DNS。
+- DHCP 只下发普通 `router` 和 `dns` 选项，不下发 classless static default route，因此不会主动覆盖 Windows 当前 WLAN 等已有网络优先级。
+- 对目标系统内核无法正常从 `wlan0-vxd` 发出转发包的情况，程序会启动轻量用户态 raw packet 转发，作为 USB/RNDIS 与 STA 出口之间的补充转发路径。
 - 同步 `/etc_rw/resolv.conf` 并通知 `dnsmasq` 重载，因为系统 `dnsmasq -i br0 -r /etc_rw/resolv.conf` 会服务下层客户端。
 - 断开或下次重连前只删除 `wpa_mini` 自己创建的精确匹配规则，不清空系统防火墙。
 

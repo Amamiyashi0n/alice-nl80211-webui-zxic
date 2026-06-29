@@ -43,6 +43,7 @@
 #define SYSTEM_DNS_PATH "/etc_rw/resolv.conf"
 #define DEFAULT_SAVED_PATH "/mnt/userdata/etc_rw/wpa_mini_saved.conf"
 #define DEFAULT_RELAY_STATE "/tmp/wpa_mini_relay.state"
+#define DEFAULT_RELAY_PIDFILE "/tmp/wpa_mini_relay.pid"
 #define DEFAULT_LAN_ADJUST_STATE "/tmp/wpa_mini_lan_adjust.state"
 #define DEFAULT_UDHCPD_CONF "/etc_rw/udhcpd.conf"
 #define DEFAULT_UDHCPD_LEASES "/etc_rw/udhcpd.leases"
@@ -77,6 +78,8 @@
 #define SYS_FS_MAX 8
 #define RELAY_IFACES_TEXT_MAX 128
 #define DIAG_TIMEOUT_MS 1800
+#define USER_NAT_MAX 128
+#define USER_NAT_TTL_MS 180000
 #define ANDROID_AID_INET 3003
 #define ANDROID_AID_NET_RAW 3004
 #define ANDROID_AID_NET_ADMIN 3005
@@ -123,6 +126,10 @@ static void get_runtime_status(const struct app_config *cfg,
 			       struct runtime_status *st);
 static void read_dns_pair(const char *path, char *dns1, size_t dns1sz,
 			  char *dns2, size_t dns2sz);
+static int start_user_nat(const struct app_config *cfg, const char *lan_if,
+			  const char *wan_if);
+static void stop_user_nat(const struct app_config *cfg);
+static int user_nat_running(void);
 
 typedef void (*wpa_msg_cb_func)(void *ctx, int level, int global,
 				const char *txt, size_t len);
@@ -177,6 +184,7 @@ struct runtime_status {
 	int relay_ip_forward;
 	int relay_nat_rule;
 	int relay_dhcp_running;
+	int relay_user_nat_running;
 };
 
 struct saved_wifi {
@@ -3448,6 +3456,7 @@ static void stop_relay(const struct app_config *cfg)
 	int nat_rule;
 	int fwd_rule;
 
+	stop_user_nat(cfg);
 	if (relay_read_state(lan_if, sizeof(lan_if), subnet, sizeof(subnet),
 			     wan_if, sizeof(wan_if), &old_forward, &nat_rule,
 			     &fwd_rule) < 0)
@@ -3530,6 +3539,22 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 		delete_relay_rule("FORWARD", "", cfg->iface, lan_if, 0);
 		delete_bridge_member_forward_rules(lan_if, subnet, cfg->iface);
 	}
+	if (start_user_nat(cfg, lan_if, cfg->iface) < 0) {
+		log_msg(cfg, "relay user nat start failed errno=%d", errno);
+		if (nat_ok)
+			delete_relay_rule("POSTROUTING", subnet, lan_if,
+					  cfg->iface, 1);
+		if (fwd_ok) {
+			delete_relay_rule("FORWARD", subnet, lan_if,
+					  cfg->iface, 0);
+			delete_relay_rule("FORWARD", "", cfg->iface,
+					  lan_if, 0);
+			delete_bridge_member_forward_rules(lan_if, subnet,
+							   cfg->iface);
+		}
+		write_int_file("/proc/sys/net/ipv4/ip_forward", old_forward);
+		return -1;
+	}
 
 	relay_write_state(lan_if, subnet, cfg->iface, old_forward, nat_ok,
 			  fwd_ok);
@@ -3552,6 +3577,7 @@ static void get_relay_status(const struct app_config *cfg,
 
 	st->relay_ip_forward =
 		read_int_file("/proc/sys/net/ipv4/ip_forward", 0);
+	st->relay_user_nat_running = user_nat_running();
 	if (relay_read_state(lan_if, sizeof(lan_if), subnet, sizeof(subnet),
 			     wan_if, sizeof(wan_if), &old_forward, &nat_rule,
 			     &fwd_rule) < 0)
@@ -3572,6 +3598,7 @@ static void get_relay_status(const struct app_config *cfg,
 			    st->ip[0] &&
 			    st->relay_ip_forward == 1 && st->relay_nat_rule &&
 			    st->relay_dhcp_running &&
+			    st->relay_user_nat_running &&
 			    !st->sta_lan_conflict && st->default_route_ready;
 	(void)cfg;
 	(void)old_forward;
@@ -3717,6 +3744,11 @@ static void put16(unsigned char *p, unsigned short v)
 {
 	p[0] = (unsigned char)(v >> 8);
 	p[1] = (unsigned char)(v & 0xff);
+}
+
+static unsigned short get16(const unsigned char *p)
+{
+	return (unsigned short)((p[0] << 8) | p[1]);
 }
 
 static int read_arp_mac(const char *ip, const char *iface,
@@ -3977,6 +4009,533 @@ static int diag_l2_icmp_ping_ip(const char *dst_ip, const char *src_ip,
 	snprintf(detail, detailsz, "l2 icmp timeout via %s", next_hop);
 	close(fd);
 	return -1;
+}
+
+struct user_nat_entry {
+	int used;
+	unsigned char proto;
+	uint32_t client_ip;
+	uint32_t remote_ip;
+	uint16_t client_id;
+	uint16_t remote_id;
+	uint16_t nat_id;
+	unsigned char client_mac[ETH_ALEN];
+	long long last_ms;
+};
+
+static unsigned long checksum_accum(unsigned long sum, const void *data,
+				    size_t len)
+{
+	const unsigned char *p = data;
+
+	while (len > 1) {
+		sum += (unsigned short)((p[0] << 8) | p[1]);
+		p += 2;
+		len -= 2;
+	}
+	if (len)
+		sum += (unsigned short)(p[0] << 8);
+	return sum;
+}
+
+static unsigned short checksum_finish(unsigned long sum)
+{
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (unsigned short)(~sum);
+}
+
+static void recompute_ip_checksum(unsigned char *ip, size_t ihl)
+{
+	ip[10] = 0;
+	ip[11] = 0;
+	put16(ip + 10, diag_checksum(ip, ihl));
+}
+
+static void recompute_l4_checksum(unsigned char *ip, size_t ihl,
+				  size_t total_len, unsigned char proto)
+{
+	unsigned char *l4 = ip + ihl;
+	size_t l4_len = total_len - ihl;
+	unsigned long sum = 0;
+	unsigned short csum;
+
+	if (proto == IPPROTO_ICMP) {
+		if (l4_len < 8)
+			return;
+		l4[2] = 0;
+		l4[3] = 0;
+		put16(l4 + 2, diag_checksum(l4, l4_len));
+		return;
+	}
+
+	if (proto == IPPROTO_TCP) {
+		if (l4_len < 20)
+			return;
+		l4[16] = 0;
+		l4[17] = 0;
+	} else if (proto == IPPROTO_UDP) {
+		if (l4_len < 8)
+			return;
+		l4[6] = 0;
+		l4[7] = 0;
+	} else {
+		return;
+	}
+
+	sum = checksum_accum(sum, ip + 12, 8);
+	sum += proto;
+	sum += (unsigned short)l4_len;
+	sum = checksum_accum(sum, l4, l4_len);
+	csum = checksum_finish(sum);
+	if (csum == 0)
+		csum = 0xffff;
+	if (proto == IPPROTO_TCP)
+		put16(l4 + 16, csum);
+	else
+		put16(l4 + 6, csum);
+}
+
+static int user_nat_packet_info(unsigned char *ip, size_t frame_ip_len,
+				unsigned char *proto, unsigned char **l4,
+				size_t *ihl, size_t *total_len)
+{
+	unsigned short frag;
+
+	if (frame_ip_len < 20 || (ip[0] >> 4) != 4)
+		return -1;
+	*ihl = (size_t)(ip[0] & 0x0f) * 4;
+	if (*ihl < 20 || *ihl > frame_ip_len)
+		return -1;
+	*total_len = get16(ip + 2);
+	if (*total_len < *ihl || *total_len > frame_ip_len)
+		return -1;
+	frag = get16(ip + 6);
+	if (frag & 0x3fff)
+		return -1;
+	*proto = ip[9];
+	*l4 = ip + *ihl;
+	return 0;
+}
+
+static int user_nat_get_id(unsigned char proto, unsigned char *l4,
+			   size_t l4_len, int outbound, uint16_t *id)
+{
+	if (proto == IPPROTO_TCP) {
+		if (l4_len < 20)
+			return -1;
+		*id = get16(l4 + (outbound ? 0 : 2));
+		return 0;
+	}
+	if (proto == IPPROTO_UDP) {
+		if (l4_len < 8)
+			return -1;
+		*id = get16(l4 + (outbound ? 0 : 2));
+		return 0;
+	}
+	if (proto == IPPROTO_ICMP) {
+		if (l4_len < 8)
+			return -1;
+		if (outbound && l4[0] != 8)
+			return -1;
+		if (!outbound && l4[0] != 0)
+			return -1;
+		*id = get16(l4 + 4);
+		return 0;
+	}
+	return -1;
+}
+
+static int user_nat_get_remote_id(unsigned char proto, unsigned char *l4,
+				  size_t l4_len, int outbound, uint16_t *id)
+{
+	if (proto == IPPROTO_TCP) {
+		if (l4_len < 20)
+			return -1;
+		*id = get16(l4 + (outbound ? 2 : 0));
+		return 0;
+	}
+	if (proto == IPPROTO_UDP) {
+		if (l4_len < 8)
+			return -1;
+		*id = get16(l4 + (outbound ? 2 : 0));
+		return 0;
+	}
+	if (proto == IPPROTO_ICMP) {
+		*id = 0;
+		return 0;
+	}
+	return -1;
+}
+
+static void user_nat_set_id(unsigned char proto, unsigned char *l4,
+			    int outbound, uint16_t id)
+{
+	if (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
+		put16(l4 + (outbound ? 0 : 2), id);
+	else if (proto == IPPROTO_ICMP)
+		put16(l4 + 4, id);
+}
+
+static void user_nat_expire(struct user_nat_entry *entries)
+{
+	long long now = now_ms();
+	int i;
+
+	for (i = 0; i < USER_NAT_MAX; i++) {
+		if (entries[i].used && now - entries[i].last_ms > USER_NAT_TTL_MS)
+			entries[i].used = 0;
+	}
+}
+
+static struct user_nat_entry *user_nat_out_entry(
+	struct user_nat_entry *entries, unsigned char proto, uint32_t client_ip,
+	uint16_t client_id, uint32_t remote_ip, uint16_t remote_id,
+	const unsigned char client_mac[ETH_ALEN])
+{
+	struct user_nat_entry *oldest = &entries[0];
+	long long now = now_ms();
+	int i;
+
+	user_nat_expire(entries);
+	for (i = 0; i < USER_NAT_MAX; i++) {
+		if (entries[i].used && entries[i].proto == proto &&
+		    entries[i].client_ip == client_ip &&
+		    entries[i].client_id == client_id &&
+		    entries[i].remote_ip == remote_ip &&
+		    entries[i].remote_id == remote_id) {
+			memcpy(entries[i].client_mac, client_mac, ETH_ALEN);
+			entries[i].last_ms = now;
+			return &entries[i];
+		}
+	}
+	for (i = 0; i < USER_NAT_MAX; i++) {
+		if (!entries[i].used) {
+			oldest = &entries[i];
+			break;
+		}
+		if (entries[i].last_ms < oldest->last_ms)
+			oldest = &entries[i];
+	}
+	memset(oldest, 0, sizeof(*oldest));
+	oldest->used = 1;
+	oldest->proto = proto;
+	oldest->client_ip = client_ip;
+	oldest->remote_ip = remote_ip;
+	oldest->client_id = client_id;
+	oldest->remote_id = remote_id;
+	oldest->nat_id = (uint16_t)(40000 + (oldest - entries));
+	memcpy(oldest->client_mac, client_mac, ETH_ALEN);
+	oldest->last_ms = now;
+	return oldest;
+}
+
+static struct user_nat_entry *user_nat_in_entry(
+	struct user_nat_entry *entries, unsigned char proto, uint16_t nat_id,
+	uint32_t remote_ip, uint16_t remote_id)
+{
+	int i;
+
+	user_nat_expire(entries);
+	for (i = 0; i < USER_NAT_MAX; i++) {
+		if (entries[i].used && entries[i].proto == proto &&
+		    entries[i].nat_id == nat_id &&
+		    entries[i].remote_ip == remote_ip &&
+		    entries[i].remote_id == remote_id) {
+			entries[i].last_ms = now_ms();
+			return &entries[i];
+		}
+	}
+	return NULL;
+}
+
+static int user_nat_open_packet(const char *iface)
+{
+	struct sockaddr_ll addr;
+	int fd;
+	int ifindex;
+
+	ifindex = if_nametoindex(iface);
+	if (!ifindex)
+		return -1;
+	fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+	if (fd < 0)
+		return -1;
+	memset(&addr, 0, sizeof(addr));
+	addr.sll_family = AF_PACKET;
+	addr.sll_protocol = htons(ETH_P_IP);
+	addr.sll_ifindex = ifindex;
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int user_nat_send_frame(int fd, int ifindex,
+			       const unsigned char dst_mac[ETH_ALEN],
+			       const unsigned char *frame, size_t len)
+{
+	struct sockaddr_ll addr;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sll_family = AF_PACKET;
+	addr.sll_protocol = htons(ETH_P_IP);
+	addr.sll_ifindex = ifindex;
+	addr.sll_halen = ETH_ALEN;
+	memcpy(addr.sll_addr, dst_mac, ETH_ALEN);
+	return sendto(fd, frame, len, 0,
+		      (struct sockaddr *)&addr, sizeof(addr)) == (ssize_t)len ?
+	       0 : -1;
+}
+
+static int user_nat_forward_out(struct user_nat_entry *entries, int wan_fd,
+				int wan_ifindex,
+				const unsigned char wan_mac[ETH_ALEN],
+				const unsigned char gw_mac[ETH_ALEN],
+				uint32_t wan_ip, uint32_t lan_net,
+				uint32_t lan_mask, unsigned char *frame,
+				size_t frame_len)
+{
+	unsigned char proto;
+	unsigned char *ip;
+	unsigned char *l4;
+	struct user_nat_entry *e;
+	size_t ihl;
+	size_t total_len;
+	uint32_t dst_ip;
+	uint32_t client_ip;
+	uint16_t client_id;
+	uint16_t remote_id;
+	size_t l4_len;
+
+	if (frame_len < 14 + 20 || frame[12] != 0x08 || frame[13] != 0x00)
+		return -1;
+	ip = frame + 14;
+	if (user_nat_packet_info(ip, frame_len - 14, &proto, &l4, &ihl,
+				 &total_len) < 0)
+		return -1;
+	memcpy(&client_ip, ip + 12, 4);
+	memcpy(&dst_ip, ip + 16, 4);
+	if ((dst_ip & lan_mask) == lan_net)
+		return -1;
+	l4_len = total_len - ihl;
+	if (user_nat_get_id(proto, l4, l4_len, 1, &client_id) < 0)
+		return -1;
+	if (user_nat_get_remote_id(proto, l4, l4_len, 1, &remote_id) < 0)
+		return -1;
+	e = user_nat_out_entry(entries, proto, client_ip, client_id, dst_ip,
+			       remote_id, frame + 6);
+
+	memcpy(frame, gw_mac, ETH_ALEN);
+	memcpy(frame + 6, wan_mac, ETH_ALEN);
+	memcpy(ip + 12, &wan_ip, 4);
+	user_nat_set_id(proto, l4, 1, e->nat_id);
+	recompute_ip_checksum(ip, ihl);
+	recompute_l4_checksum(ip, ihl, total_len, proto);
+	return user_nat_send_frame(wan_fd, wan_ifindex, gw_mac, frame,
+				   14 + total_len);
+}
+
+static int user_nat_forward_in(struct user_nat_entry *entries, int lan_fd,
+			       int lan_ifindex,
+			       const unsigned char lan_mac[ETH_ALEN],
+			       uint32_t wan_ip, unsigned char *frame,
+			       size_t frame_len)
+{
+	unsigned char proto;
+	unsigned char *ip;
+	unsigned char *l4;
+	struct user_nat_entry *e;
+	size_t ihl;
+	size_t total_len;
+	uint32_t src_ip;
+	uint32_t dst_ip;
+	uint16_t nat_id;
+	uint16_t remote_id;
+	size_t l4_len;
+
+	if (frame_len < 14 + 20 || frame[12] != 0x08 || frame[13] != 0x00)
+		return -1;
+	ip = frame + 14;
+	if (user_nat_packet_info(ip, frame_len - 14, &proto, &l4, &ihl,
+				 &total_len) < 0)
+		return -1;
+	memcpy(&src_ip, ip + 12, 4);
+	memcpy(&dst_ip, ip + 16, 4);
+	if (dst_ip != wan_ip)
+		return -1;
+	l4_len = total_len - ihl;
+	if (user_nat_get_id(proto, l4, l4_len, 0, &nat_id) < 0)
+		return -1;
+	if (user_nat_get_remote_id(proto, l4, l4_len, 0, &remote_id) < 0)
+		return -1;
+	e = user_nat_in_entry(entries, proto, nat_id, src_ip, remote_id);
+	if (!e)
+		return -1;
+
+	memcpy(frame, e->client_mac, ETH_ALEN);
+	memcpy(frame + 6, lan_mac, ETH_ALEN);
+	memcpy(ip + 16, &e->client_ip, 4);
+	user_nat_set_id(proto, l4, 0, e->client_id);
+	recompute_ip_checksum(ip, ihl);
+	recompute_l4_checksum(ip, ihl, total_len, proto);
+	return user_nat_send_frame(lan_fd, lan_ifindex, e->client_mac, frame,
+				   14 + total_len);
+}
+
+static int user_nat_main(const struct app_config *cfg, const char *lan_if,
+			 const char *wan_if)
+{
+	struct user_nat_entry entries[USER_NAT_MAX];
+	struct in_addr lan_ip;
+	struct in_addr lan_mask;
+	struct in_addr wan_addr;
+	struct in_addr wan_mask;
+	uint32_t lan_net;
+	uint32_t wan_ip;
+	unsigned char lan_mac[ETH_ALEN];
+	unsigned char wan_mac[ETH_ALEN];
+	unsigned char gw_mac[ETH_ALEN];
+	char wan_ip_text[64];
+	char gw_text[64];
+	char detail[192];
+	int lan_fd;
+	int wan_fd;
+	int lan_ifindex;
+	int wan_ifindex;
+	unsigned long out_pkts = 0;
+	unsigned long in_pkts = 0;
+
+	memset(entries, 0, sizeof(entries));
+	if (read_iface_ipv4_net(lan_if, &lan_ip, &lan_mask) < 0 ||
+	    read_iface_ipv4_net(wan_if, &wan_addr, &wan_mask) < 0 ||
+	    read_iface_mac(lan_if, lan_mac) < 0 ||
+	    read_iface_mac(wan_if, wan_mac) < 0 ||
+	    read_gateway(wan_if, gw_text, sizeof(gw_text)) < 0) {
+		log_msg(cfg, "user nat init failed errno=%d", errno);
+		return 1;
+	}
+	if (!inet_ntop(AF_INET, &wan_addr, wan_ip_text, sizeof(wan_ip_text)))
+		return 1;
+	if (read_arp_mac(gw_text, wan_if, gw_mac) < 0 &&
+	    resolve_arp_mac_l2(gw_text, wan_ip_text, wan_if, gw_mac,
+			       DIAG_TIMEOUT_MS, detail, sizeof(detail)) < 0) {
+		log_msg(cfg, "user nat gateway arp failed: %s", detail);
+		return 1;
+	}
+	lan_net = lan_ip.s_addr & lan_mask.s_addr;
+	wan_ip = wan_addr.s_addr;
+	lan_ifindex = if_nametoindex(lan_if);
+	wan_ifindex = if_nametoindex(wan_if);
+	if (!lan_ifindex || !wan_ifindex)
+		return 1;
+	lan_fd = user_nat_open_packet(lan_if);
+	if (lan_fd < 0) {
+		log_msg(cfg, "user nat lan socket failed errno=%d", errno);
+		return 1;
+	}
+	wan_fd = user_nat_open_packet(wan_if);
+	if (wan_fd < 0) {
+		log_msg(cfg, "user nat wan socket failed errno=%d", errno);
+		close(lan_fd);
+		return 1;
+	}
+	log_msg(cfg, "user nat started lan=%s wan=%s gateway=%s",
+		lan_if, wan_if, gw_text);
+
+	for (;;) {
+		unsigned char frame[1600];
+		struct sockaddr_ll from;
+		socklen_t fromlen;
+		fd_set rfds;
+		int maxfd;
+		int ret;
+		ssize_t n;
+
+		FD_ZERO(&rfds);
+		FD_SET(lan_fd, &rfds);
+		FD_SET(wan_fd, &rfds);
+		maxfd = lan_fd > wan_fd ? lan_fd : wan_fd;
+		ret = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (FD_ISSET(lan_fd, &rfds)) {
+			fromlen = sizeof(from);
+			n = recvfrom(lan_fd, frame, sizeof(frame), 0,
+				     (struct sockaddr *)&from, &fromlen);
+			if (n > 0 && from.sll_pkttype != PACKET_OUTGOING &&
+			    user_nat_forward_out(entries, wan_fd, wan_ifindex,
+						 wan_mac, gw_mac, wan_ip,
+						 lan_net, lan_mask.s_addr,
+						 frame, (size_t)n) == 0)
+				out_pkts++;
+		}
+		if (FD_ISSET(wan_fd, &rfds)) {
+			fromlen = sizeof(from);
+			n = recvfrom(wan_fd, frame, sizeof(frame), 0,
+				     (struct sockaddr *)&from, &fromlen);
+			if (n > 0 && from.sll_pkttype != PACKET_OUTGOING &&
+			    user_nat_forward_in(entries, lan_fd, lan_ifindex,
+						lan_mac, wan_ip, frame,
+						(size_t)n) == 0)
+				in_pkts++;
+		}
+		if (((out_pkts + in_pkts) & 0xff) == 1)
+			log_msg(cfg, "user nat packets out=%lu in=%lu",
+				out_pkts, in_pkts);
+	}
+
+	close(lan_fd);
+	close(wan_fd);
+	log_msg(cfg, "user nat stopped out=%lu in=%lu errno=%d",
+		out_pkts, in_pkts, errno);
+	return 0;
+}
+
+static int user_nat_running(void)
+{
+	pid_t pid;
+
+	return read_pid(DEFAULT_RELAY_PIDFILE, &pid) == 0 &&
+	       process_running(pid);
+}
+
+static void stop_user_nat(const struct app_config *cfg)
+{
+	log_msg(cfg, "user nat stop requested");
+	stop_pidfile_process(DEFAULT_RELAY_PIDFILE);
+}
+
+static int start_user_nat(const struct app_config *cfg, const char *lan_if,
+			  const char *wan_if)
+{
+	pid_t pid;
+
+	stop_user_nat(cfg);
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		close_inherited_fds();
+		_exit(user_nat_main(cfg, lan_if, wan_if));
+	}
+	if (write_pid(DEFAULT_RELAY_PIDFILE, pid) < 0) {
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, WNOHANG);
+		return -1;
+	}
+	usleep(200000);
+	if (!process_running(pid)) {
+		waitpid(pid, NULL, WNOHANG);
+		unlink(DEFAULT_RELAY_PIDFILE);
+		return -1;
+	}
+	log_msg(cfg, "user nat child pid=%ld", (long)pid);
+	return 0;
 }
 
 static int diag_tcp_connect_ip(const char *dst_ip, int port,
@@ -5786,7 +6345,7 @@ static void append_home_content(char *body, size_t bodysz,
 		   "<div class=\"kv\"><div class=\"k\">下层网络</div><div class=\"v\">%s %s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">热点/USB 接口</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">上游出口</div><div class=\"v\">%s</div></div>"
-		   "<div class=\"kv\"><div class=\"k\">ip_forward / NAT / DHCP</div><div class=\"v\">%d / %s / %s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">ip_forward / NAT / DHCP / 用户态转发</div><div class=\"v\">%d / %s / %s / %s</div></div>"
 		   "</div></div></section></div>%s%s%s",
 		   esc_bssid[0] ? esc_bssid : "-",
 		   esc_gw[0] ? esc_gw : "-",
@@ -5800,6 +6359,7 @@ static void append_home_content(char *body, size_t bodysz,
 		   st->relay_ip_forward,
 		   st->relay_nat_rule ? "存在" : "无",
 		   st->relay_dhcp_running ? "运行" : "停止",
+		   st->relay_user_nat_running ? "运行" : "停止",
 		   autostart_html, saved_html, scan_html);
 }
 
@@ -5942,7 +6502,7 @@ static void render_status(int fd, const struct app_config *cfg)
 		 "\"relay_lan_members\":\"%s\",\"relay_lan_subnet\":\"%s\","
 		 "\"relay_wan_iface\":\"%s\","
 		 "\"relay_ip_forward\":%d,\"relay_nat_rule\":%s,"
-		 "\"relay_dhcp_running\":%s,"
+		 "\"relay_dhcp_running\":%s,\"relay_user_nat_running\":%s,"
 		 "\"port\":%d}\n",
 		 st.engine_running ? "true" : "false",
 		 st.engine_running ? (long)st.engine_pid : 0L,
@@ -5959,6 +6519,7 @@ static void render_status(int fd, const struct app_config *cfg)
 		 st.relay_ip_forward,
 		 st.relay_nat_rule ? "true" : "false",
 		 st.relay_dhcp_running ? "true" : "false",
+		 st.relay_user_nat_running ? "true" : "false",
 		 cfg->port);
 	http_send(fd, cfg, 200, "OK", "application/json", body);
 }
