@@ -201,6 +201,7 @@ struct saved_wifi {
 	int hidden;
 	int route;
 	int relay;
+	int auto_lan;
 	int autoconnect;
 };
 
@@ -2103,6 +2104,9 @@ static int load_saved_wifi(struct saved_wifi *items, int max_items)
 			     value[0] == '1' : 1;
 		item.relay = form_value(line, "relay", value, sizeof(value)) &&
 			     value[0] == '1';
+		item.auto_lan = form_value(line, "auto_lan", value,
+					   sizeof(value)) ?
+				value[0] == '1' : 1;
 		item.autoconnect = form_value(line, "autoconnect", value,
 					      sizeof(value)) ?
 				   value[0] == '1' : 1;
@@ -2151,9 +2155,11 @@ static int save_saved_wifi(const struct saved_wifi *items, int count)
 		url_encode(psk, sizeof(psk), items[i].psk);
 		url_encode(dns1, sizeof(dns1), items[i].dns1);
 		url_encode(dns2, sizeof(dns2), items[i].dns2);
-		fprintf(fp, "ssid=%s&psk=%s&dns1=%s&dns2=%s&hidden=%d&route=%d&relay=%d&autoconnect=%d\n",
+		fprintf(fp,
+			"ssid=%s&psk=%s&dns1=%s&dns2=%s&hidden=%d&route=%d&relay=%d&auto_lan=%d&autoconnect=%d\n",
 			ssid, psk, dns1, dns2, items[i].hidden ? 1 : 0,
 			items[i].route ? 1 : 0, items[i].relay ? 1 : 0,
+			items[i].auto_lan ? 1 : 0,
 			items[i].autoconnect ? 1 : 0);
 	}
 
@@ -2166,7 +2172,7 @@ static int save_saved_wifi(const struct saved_wifi *items, int count)
 static void remember_wifi(const char *ssid, const char *psk,
 			  const char *dns1,
 			  const char *dns2, int hidden, int route, int relay,
-			  int autoconnect)
+			  int auto_lan, int autoconnect)
 {
 	struct saved_wifi items[SAVED_WIFI_MAX];
 	struct saved_wifi kept[SAVED_WIFI_MAX];
@@ -2183,6 +2189,7 @@ static void remember_wifi(const char *ssid, const char *psk,
 	next.hidden = hidden ? 1 : 0;
 	next.relay = relay ? 1 : 0;
 	next.route = (route || relay) ? 1 : 0;
+	next.auto_lan = auto_lan ? 1 : 0;
 	next.autoconnect = autoconnect ? 1 : 0;
 
 	count = load_saved_wifi(items, SAVED_WIFI_MAX);
@@ -2233,6 +2240,44 @@ static int set_saved_autoconnect(const char *ssid, int enabled)
 	if (!changed)
 		return -1;
 	return save_saved_wifi(items, count);
+}
+
+static int set_saved_relay(const char *ssid, int enabled)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	int count;
+	int i;
+	int changed = 0;
+
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	for (i = 0; i < count; i++) {
+		if (strcmp(items[i].ssid, ssid) != 0)
+			continue;
+		items[i].relay = enabled ? 1 : 0;
+		if (items[i].relay)
+			items[i].route = 1;
+		changed = 1;
+		break;
+	}
+	if (!changed)
+		return -1;
+	return save_saved_wifi(items, count);
+}
+
+static int saved_auto_lan_for_ssid(const char *ssid)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	int count;
+	int i;
+
+	if (!ssid || !ssid[0])
+		return 1;
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	for (i = 0; i < count; i++) {
+		if (strcmp(items[i].ssid, ssid) == 0)
+			return items[i].auto_lan ? 1 : 0;
+	}
+	return 1;
 }
 
 static char *read_file_alloc(const char *path, size_t maxsz, size_t *len_out)
@@ -3702,26 +3747,15 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 {
 	const char *lan_if = "br0";
 	char subnet[64];
-	char adjusted_subnet[64];
 	int old_forward;
 	int nat_ok = 0;
 	int fwd_ok = 0;
 
 	if (ifaces_same_subnet(cfg->iface, lan_if)) {
-		uint32_t net_host;
-
-		log_msg(cfg, "relay subnet conflict detected: %s and %s share subnet",
+		log_msg(cfg, "relay start failed: %s and %s share subnet",
 			cfg->iface, lan_if);
-		if (choose_lan_subnet(&net_host) < 0 ||
-		    adjust_lan_subnet(cfg, net_host, dns1, dns2,
-				      adjusted_subnet,
-				      sizeof(adjusted_subnet)) < 0) {
-			log_msg(cfg, "relay lan auto adjust failed errno=%d", errno);
-			errno = EINVAL;
-			return -1;
-		}
-		log_msg(cfg, "relay lan auto adjusted subnet=%s",
-			adjusted_subnet);
+		errno = EADDRINUSE;
+		return -1;
 	}
 	if (!iface_has_default_route(cfg->iface)) {
 		log_msg(cfg, "relay start failed: no default route on %s",
@@ -3784,6 +3818,51 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 	refresh_usb_bridge_members(cfg, lan_if);
 	log_msg(cfg, "relay started lan=%s subnet=%s wan=%s old_forward=%d fwd=%d",
 		lan_if, subnet, cfg->iface, old_forward, fwd_ok);
+	return 0;
+}
+
+static int prepare_relay_route(const struct app_config *cfg, const char *dns1,
+			       const char *dns2, int auto_lan,
+			       char *new_subnet, size_t new_subnet_sz)
+{
+	char local_subnet[64];
+	char *subnet_out = new_subnet;
+	size_t subnet_out_sz = new_subnet_sz;
+
+	if (new_subnet && new_subnet_sz)
+		new_subnet[0] = '\0';
+	if (!subnet_out || !subnet_out_sz) {
+		subnet_out = local_subnet;
+		subnet_out_sz = sizeof(local_subnet);
+		local_subnet[0] = '\0';
+	}
+	if (ifaces_same_subnet(cfg->iface, "br0")) {
+		uint32_t net_host;
+
+		log_msg(cfg, "relay prepare subnet conflict detected");
+		if (!auto_lan) {
+			errno = EADDRINUSE;
+			return -1;
+		}
+		if (choose_lan_subnet(&net_host) < 0 ||
+		    adjust_lan_subnet(cfg, net_host, dns1, dns2,
+				      subnet_out, subnet_out_sz) < 0) {
+			log_msg(cfg, "relay prepare lan auto adjust failed errno=%d",
+				errno);
+			return -1;
+		}
+		stop_dhcp(cfg);
+		if (start_dhcp(cfg, dns1, dns2, 1) < 0 ||
+		    wait_ipv4_ready(cfg, 8000) < 0) {
+			log_msg(cfg, "relay prepare sta dhcp restore failed errno=%d",
+				errno);
+			return -1;
+		}
+	}
+	if (wait_default_route_ready(cfg, 5000) < 0) {
+		log_msg(cfg, "relay prepare default route missing errno=%d", errno);
+		return -1;
+	}
 	return 0;
 }
 
@@ -5901,7 +5980,7 @@ out:
 static int connect_wifi_internal(const struct app_config *cfg,
 				 const char *ssid, const char *psk,
 				 const char *dns1, const char *dns2,
-				 int hidden, int use_route, int relay)
+				 int hidden, int use_route, int relay, int auto_lan)
 {
 	char use_dns1[64];
 	char use_dns2[64];
@@ -5936,7 +6015,10 @@ static int connect_wifi_internal(const struct app_config *cfg,
 		return -1;
 	if (wait_ipv4_ready(cfg, 8000) < 0)
 		return -1;
-	if (use_route && wait_default_route_ready(cfg, 5000) < 0)
+	if (relay &&
+	    prepare_relay_route(cfg, use_dns1, use_dns2, auto_lan, NULL, 0) < 0)
+		return -1;
+	if (!relay && use_route && wait_default_route_ready(cfg, 5000) < 0)
 		return -1;
 	if (relay && start_relay(cfg, use_dns1, use_dns2) < 0)
 		return -1;
@@ -6001,10 +6083,11 @@ static int start_autoconnect_worker(const struct app_config *cfg,
 		if (connect_wifi_internal(cfg, item->ssid, item->psk,
 					  item->dns1, item->dns2,
 					  item->hidden, item->route,
-					  item->relay) == 0) {
+					  item->relay, item->auto_lan) == 0) {
 			remember_wifi(item->ssid, item->psk, item->dns1,
 				      item->dns2, item->hidden, item->route,
-				      item->relay, item->autoconnect);
+				      item->relay, item->auto_lan,
+				      item->autoconnect);
 			log_msg(cfg, "autoconnect worker completed ssid=%s",
 				item->ssid);
 			_exit(0);
@@ -6237,25 +6320,27 @@ static void build_saved_html(char *out, size_t outsz)
 			html_escape(esc_ssid, sizeof(esc_ssid), items[i].ssid);
 			html_escape(esc_dns1, sizeof(esc_dns1), items[i].dns1);
 			html_escape(esc_dns2, sizeof(esc_dns2), items[i].dns2);
-				buf_append(out, outsz,
-					   "<div class=\"saved\"><div><div class=\"v\">%s</div>"
-					   "<div class=\"hint\">DNS %s / %s%s%s%s</div></div>"
-					   "<div class=\"savedact\">"
-					   "<form method=\"post\" action=\"/connect_saved\"><input type=\"hidden\" name=\"idx\" value=\"%d\"><button type=\"submit\">连接</button></form>"
-					   "<form method=\"post\" action=\"/autoconnect_saved\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><input type=\"hidden\" name=\"enabled\" value=\"%d\"><button class=\"alt\" type=\"submit\">%s</button></form>"
-					   "<form method=\"post\" action=\"/forget\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><button class=\"alt\" type=\"submit\">删除</button></form>"
-					   "</div></div>",
-					   esc_ssid,
-					   esc_dns1[0] ? esc_dns1 : DEFAULT_DNS1,
-					   esc_dns2[0] ? esc_dns2 : DEFAULT_DNS2,
-					   items[i].hidden ? " · 隐藏" : "",
-					   items[i].relay ? " · 中继" : "",
-					   items[i].autoconnect ? " · 范围内自动连接" :
-					   " · 不自动连接",
-					   i, esc_ssid, items[i].autoconnect ? 0 : 1,
-					   items[i].autoconnect ? "关闭自动连接" :
-					   "开启自动连接",
-					   esc_ssid);
+			buf_append(out, outsz,
+				   "<div class=\"saved\"><div><div class=\"v\">%s</div>"
+				   "<div class=\"hint\">DNS %s / %s%s%s%s%s</div></div>"
+				   "<div class=\"savedact\">"
+				   "<form method=\"post\" action=\"/connect_saved\"><input type=\"hidden\" name=\"idx\" value=\"%d\"><button type=\"submit\">连接</button></form>"
+				   "<form method=\"post\" action=\"/autoconnect_saved\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><input type=\"hidden\" name=\"enabled\" value=\"%d\"><button class=\"alt\" type=\"submit\">%s</button></form>"
+				   "<form method=\"post\" action=\"/forget\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><button class=\"alt\" type=\"submit\">删除</button></form>"
+				   "</div></div>",
+				   esc_ssid,
+				   esc_dns1[0] ? esc_dns1 : DEFAULT_DNS1,
+				   esc_dns2[0] ? esc_dns2 : DEFAULT_DNS2,
+				   items[i].hidden ? " · 隐藏" : "",
+				   items[i].relay ? " · 自动共享网络" : "",
+				   items[i].relay && items[i].auto_lan ?
+				   " · 自动调整网段" : "",
+				   items[i].autoconnect ? " · 范围内自动连接" :
+				   " · 不自动连接",
+				   i, esc_ssid, items[i].autoconnect ? 0 : 1,
+				   items[i].autoconnect ? "关闭自动连接" :
+				   "开启自动连接",
+				   esc_ssid);
 		}
 	}
 	buf_append(out, outsz, "</div></section>");
@@ -6663,7 +6748,7 @@ static void append_page_start(char *body, size_t bodysz,
 		   "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:700}"
 		   ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}button.alt,button.scan{background:#fff;color:#2f7d4f}"
 		   ".tablewrap{overflow:auto}.saved{border:1px solid #edf2ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:800;color:#1d3b29}.tag{display:inline-block;margin-left:5px;border-radius:5px;background:#e4f1e8;color:#286542;padding:2px 5px;font-size:11px}.focusrow{background:#f0f8f2}.defrow{background:#f8fbf3}.tinylink{font-size:12px;font-weight:800;color:#2f7d4f;border:1px solid #d1e5d7;border-radius:999px;padding:6px 9px;background:#fbfffc}"
-		   ".about{display:grid;grid-template-columns:148px minmax(0,1fr);gap:18px;align-items:center}.avatar{width:132px;height:132px;border-radius:8px;object-fit:cover;border:1px solid #d9e5dc;box-shadow:0 8px 22px rgba(24,37,29,.08)}.aboutname{font-size:20px;font-weight:800;margin-bottom:7px}.signature{margin-top:13px;color:#2f5f40;font-size:15px;font-weight:800;line-height:1.7}.repo{display:inline-block;margin-top:13px;color:#1f6d42;font-weight:800;word-break:break-all}.supportgrid{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:14px}.supportcard{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:14px;min-width:0}.supporttitle{font-size:15px;font-weight:800;margin-bottom:7px}.supportlink{display:inline-block;margin-top:12px;border-radius:6px;background:#2f7d4f;color:#fff;font-weight:800;padding:10px 13px}.qrbox{display:flex;justify-content:center}.qr{display:block;width:100%%;max-width:190px;height:auto;border-radius:8px;border:1px solid #e5dff0;background:#fff;box-shadow:0 8px 18px rgba(24,37,29,.06)}"
+		   ".about{display:grid;grid-template-columns:148px minmax(0,1fr);gap:18px;align-items:center}.avatar{width:132px;height:132px;border-radius:8px;object-fit:cover;border:1px solid #d9e5dc;box-shadow:0 8px 22px rgba(24,37,29,.08)}.aboutname{font-size:20px;font-weight:800;margin-bottom:7px}.signature{margin-top:13px;color:#2f5f40;font-size:15px;font-weight:800;line-height:1.7}.repo{display:inline-block;margin-top:13px;color:#1f6d42;font-weight:800;word-break:break-all}.labelrow{margin-top:13px;color:#5f7166;font-size:13px;font-weight:800}.labelrow .repo{margin-top:0}.supporthead{display:block}.supportdesc{color:#405246;font-size:14px;font-weight:700;line-height:1.75;margin-top:7px}.supportgrid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:14px;align-items:stretch}.supportcard{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:14px;min-width:0}.supporttitle{font-size:15px;font-weight:800;margin-bottom:7px}.plainlink{display:inline-block;color:#1f6d42;font-weight:800;word-break:break-all}.qrbox{display:flex;justify-content:center;align-items:center}.qr{display:block;width:100%%;max-width:190px;height:auto;border-radius:8px;border:1px solid #e5dff0;background:#fff;box-shadow:0 8px 18px rgba(24,37,29,.06)}"
 		   "table{width:100%%;border-collapse:collapse;font-size:13px;min-width:680px}th,td{text-align:left;border-bottom:1px solid #e7eee8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:800}"
 		   "@media(max-width:860px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc;padding:12px}.brandbox{padding-bottom:6px}.nav{flex-direction:row;overflow:auto}.nav a{white-space:nowrap}.sidecard{display:none}main.page{padding:16px}.topline{align-items:flex-start}.layout,.grid,.twocol,.summary,.about,.supportgrid{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}.topmeta{text-align:left}.qr{max-width:220px}}"
 		   "</style></head><body><div class=\"shell\"><aside class=\"side\">"
@@ -6741,14 +6826,11 @@ static void append_home_content(char *body, size_t bodysz,
 		       connected && !st->default_route_ready ?
 		       "已关联 WiFi，但没有默认网关，暂不能作为外网出口" :
 		       "本设备已通过这个 WiFi 获取地址";
-	share_state = st->sta_lan_conflict ? "需调整网段" :
-		      connected && !st->default_route_ready ? "缺少网关" :
+	share_state = connected && !st->default_route_ready &&
+		      !st->sta_lan_conflict ? "缺少网关" :
 		      st->relay_enabled ? "已开启" : "未开启";
-	share_action = st->relay_enabled ? "/relay_off" :
-		       "/relay_on";
+	share_action = st->relay_enabled ? "/relay_off" : "/relay_on";
 	share_button = st->relay_enabled ? "关闭共享网络" :
-		       st->sta_lan_conflict ?
-		       "自动调整网段并共享网络" :
 		       "共享网络给热点和 USB 设备";
 	share_class = st->relay_enabled ? " class=\"alt\"" : "";
 
@@ -6794,8 +6876,9 @@ static void append_home_content(char *body, size_t bodysz,
 			   "<div class=\"twocol\"><div><label>DNS 1</label><input name=\"dns1\" value=\"" DEFAULT_DNS1 "\" inputmode=\"decimal\"></div>"
 			   "<div><label>DNS 2</label><input name=\"dns2\" value=\"" DEFAULT_DNS2 "\" inputmode=\"decimal\"></div></div>"
 			   "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">隐藏 SSID</label></div>"
-			   "<div class=\"check\"><input id=\"autoconnect\" name=\"autoconnect\" value=\"1\" type=\"checkbox\" checked><label for=\"autoconnect\">这个 WiFi 在范围内时自动连接</label></div>"
+			   "<div class=\"check\"><input id=\"autoconnect\" name=\"autoconnect\" value=\"1\" type=\"checkbox\" checked><label for=\"autoconnect\">此 WiFi 在范围内时自动连接</label></div>"
 			   "<div class=\"check\"><input id=\"relay\" name=\"relay\" value=\"1\" type=\"checkbox\"><label for=\"relay\">连接后共享网络给热点和 USB 设备</label></div>"
+			   "<div class=\"check\"><input id=\"auto_lan\" name=\"auto_lan\" value=\"1\" type=\"checkbox\" checked><label for=\"auto_lan\">网段冲突时自动调整热点/USB 网段</label></div>"
 			   "<div class=\"actions\"><button type=\"submit\">连接</button></div></form>"
 			   "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描 WiFi</button></form>"
 			   "<form method=\"post\" action=\"/disconnect\"><button class=\"alt\" type=\"submit\">断开</button></form></div></div></section>",
@@ -6957,20 +7040,20 @@ static void render_about_page(int fd, const struct app_config *cfg)
 		   "<img class=\"avatar\" src=\"/avatar.jpg\" alt=\"avatar\">"
 		   "<div><div class=\"aboutname\">alice-nl80211-webui-zxic</div>"
 		   "<div class=\"hint\">轻量 WiFi STA WebUI 与 WPA Mini 运行环境</div>"
-		   "<a class=\"repo\" href=\"https://github.com/Amamiyashi0n/alice-nl80211-webui-zxic\">"
-		   "github.com/Amamiyashi0n/alice-nl80211-webui-zxic</a>"
+		   "<div class=\"labelrow\">项目地址：<a class=\"repo\" href=\"https://github.com/Amamiyashi0n/alice-nl80211-webui-zxic\">"
+		   "github.com/Amamiyashi0n/alice-nl80211-webui-zxic</a></div>"
 		   "<div class=\"signature\">世间自有尘寰在，我亦独吟游且歌。</div>"
 		   "</div></div></section>"
-		   "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">赞助支持</div>"
-		   "<div class=\"hint\">链接或扫码均可</div></div><div class=\"pad supportgrid\">"
-		   "<div class=\"supportcard\"><div class=\"supporttitle\">爱发电链接赞助</div>"
-		   "<div class=\"hint\">打开爱发电页面支持项目维护。</div>"
-		   "<a class=\"supportlink\" href=\"https://ifdian.net/a/amamiyashion\">"
-		   "前往爱发电</a>"
-		   "<a class=\"repo\" href=\"https://ifdian.net/a/amamiyashion\">"
-		   "ifdian.net/a/amamiyashion</a></div>"
+		   "<section class=\"panel\"><div class=\"formtop\"><div class=\"supporthead\">"
+		   "<div class=\"title\">赞助支持</div>"
+		   "<div class=\"supportdesc\">软件免费，代码开源。<br>"
+		   "如果可以的话，也许您可以给予我一些小小的帮助。</div></div></div>"
+		   "<div class=\"pad supportgrid\">"
 		   "<div class=\"supportcard\"><div class=\"supporttitle\">微信 / 支付宝扫码</div>"
 		   "<div class=\"qrbox\"><img class=\"qr\" src=\"/sponsor.jpg\" alt=\"sponsor qrcode\"></div>"
+		   "</div><div class=\"supportcard\"><div class=\"supporttitle\">爱发电</div>"
+		   "<a class=\"plainlink\" href=\"https://ifdian.net/a/amamiyashion\">"
+		   "ifdian.net/a/amamiyashion</a>"
 		   "</div></div></section>");
 	append_page_end(body, PAGE_BODY_MAX);
 	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
@@ -7131,7 +7214,8 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 				 const char *ssid, const char *psk,
 				 const char *dns1,
 				 const char *dns2, int hidden, int use_route,
-				 int relay, int remember, int autoconnect)
+				 int relay, int remember, int auto_lan,
+				 int autoconnect)
 {
 	char use_dns1[64];
 	char use_dns2[64];
@@ -7174,7 +7258,7 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 
 	if (remember)
 		remember_wifi(ssid, psk, use_dns1, use_dns2, hidden,
-			      use_route, relay, autoconnect);
+			      use_route, relay, auto_lan, autoconnect);
 
 	if (start_dhcp(cfg, use_dns1, use_dns2, use_route) < 0) {
 		render_page(fd, cfg, "WiFi 已连接，但 udhcpc 启动失败。", NULL);
@@ -7186,7 +7270,16 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 		render_page(fd, cfg, "WiFi 已连接，但 DHCP 暂未分配 IP。", NULL);
 		return;
 	}
-	if (use_route && wait_default_route_ready(cfg, 5000) < 0) {
+	if (relay &&
+	    prepare_relay_route(cfg, use_dns1, use_dns2, auto_lan, NULL, 0) < 0) {
+		render_page(fd, cfg,
+			    auto_lan ?
+			    "WiFi 已连接，但热点/USB 网段自动调整或默认网关恢复失败。" :
+			    "WiFi 已连接，但上游网段和热点/USB 网段冲突，且已关闭自动调整。",
+			    NULL);
+		return;
+	}
+	if (!relay && use_route && wait_default_route_ready(cfg, 5000) < 0) {
 		log_msg(cfg, "connect warning: default route not ready");
 		render_page(fd, cfg, "WiFi 已连接，但默认网关尚未就绪。", NULL);
 		return;
@@ -7212,6 +7305,7 @@ static void handle_connect(int fd, const struct app_config *cfg,
 	int hidden;
 	int use_route;
 	int relay;
+	int auto_lan;
 	int autoconnect;
 
 	form_value(body, "ssid", ssid, sizeof(ssid));
@@ -7220,11 +7314,12 @@ static void handle_connect(int fd, const struct app_config *cfg,
 	form_value(body, "dns2", dns2, sizeof(dns2));
 	hidden = form_value(body, "hidden", value, sizeof(value)) && value[0];
 	relay = form_value(body, "relay", value, sizeof(value)) && value[0];
+	auto_lan = form_value(body, "auto_lan", value, sizeof(value)) && value[0];
 	autoconnect = form_value(body, "autoconnect", value, sizeof(value)) &&
 		      value[0];
 	use_route = 1;
 	connect_wifi_request(fd, cfg, ssid, psk, dns1, dns2, hidden,
-			     use_route, relay, 1, autoconnect);
+			     use_route, relay, 1, auto_lan, autoconnect);
 }
 
 static void handle_connect_saved(int fd, const struct app_config *cfg,
@@ -7256,7 +7351,8 @@ static void handle_connect_saved(int fd, const struct app_config *cfg,
 	}
 	connect_wifi_request(fd, cfg, items[idx].ssid, items[idx].psk,
 			     items[idx].dns1, items[idx].dns2, items[idx].hidden,
-			     1, items[idx].relay, 1, items[idx].autoconnect);
+			     1, items[idx].relay, 1, items[idx].auto_lan,
+			     items[idx].autoconnect);
 }
 
 static void handle_forget(int fd, const struct app_config *cfg,
@@ -7369,16 +7465,11 @@ static void handle_relay_on(int fd, const struct app_config *cfg)
 	struct runtime_status st;
 	char dns1[64];
 	char dns2[64];
+	int auto_lan;
 
 	get_runtime_status(cfg, &st);
 	if (!runtime_is_connected(&st)) {
 		render_page(fd, cfg, "请先连接 WiFi，获取 IP 后才能共享网络。", NULL);
-		return;
-	}
-	if (!st.default_route_ready) {
-		render_page(fd, cfg,
-			    "不能开启共享网络：当前 WiFi 没有默认网关，设备还不能通过它访问外网。",
-			    NULL);
 		return;
 	}
 
@@ -7388,11 +7479,23 @@ static void handle_relay_on(int fd, const struct app_config *cfg)
 	if (!dns2[0])
 		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
 
+	auto_lan = saved_auto_lan_for_ssid(st.ssid);
+	if (prepare_relay_route(cfg, dns1, dns2, auto_lan, NULL, 0) < 0) {
+		render_page(fd, cfg,
+			    auto_lan ?
+			    "共享网络启用失败：热点/USB 网段自动调整或默认网关恢复失败。" :
+			    "共享网络启用失败：上游网段和热点/USB 网段冲突，且已关闭自动调整。",
+			    NULL);
+		return;
+	}
 	if (start_relay(cfg, dns1, dns2) < 0) {
 		render_page(fd, cfg, "共享网络启用失败，请检查 br0、iptables 和日志。", NULL);
 		return;
 	}
 
+	if (st.ssid[0] && set_saved_relay(st.ssid, 1) < 0)
+		log_msg(cfg, "relay preference save failed ssid=%s errno=%d",
+			st.ssid, errno);
 	log_msg(cfg, "relay enabled by webui");
 	render_page(fd, cfg, "已开启共享网络。", NULL);
 }
@@ -7444,13 +7547,22 @@ static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
 			    NULL);
 		return;
 	}
+	if (st.ssid[0] && set_saved_relay(st.ssid, 1) < 0)
+		log_msg(cfg, "relay preference save failed ssid=%s errno=%d",
+			st.ssid, errno);
 	log_msg(cfg, "relay fix lan completed subnet=%s", new_subnet);
 	render_page(fd, cfg, "已调整热点/USB 网段并开启共享网络。", NULL);
 }
 
 static void handle_relay_off(int fd, const struct app_config *cfg)
 {
+	struct runtime_status st;
+
+	get_runtime_status(cfg, &st);
 	stop_relay(cfg);
+	if (st.ssid[0] && set_saved_relay(st.ssid, 0) < 0)
+		log_msg(cfg, "relay preference clear failed ssid=%s errno=%d",
+			st.ssid, errno);
 	log_msg(cfg, "relay disabled by webui");
 	render_page(fd, cfg, "已关闭共享网络。", NULL);
 }
@@ -7836,7 +7948,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "warning: failed to start udhcpc\n");
 	else if (wait_ipv4_ready(&cfg, 8000) < 0)
 		fprintf(stderr, "warning: DHCP has not assigned an IP yet\n");
-	else if (use_default_route &&
+	else if (relay &&
+		 prepare_relay_route(&cfg, DEFAULT_DNS1, DEFAULT_DNS2,
+				     1, NULL, 0) < 0)
+		fprintf(stderr, "warning: failed to prepare WiFi relay route\n");
+	else if (!relay && use_default_route &&
 		 wait_default_route_ready(&cfg, 5000) < 0)
 		fprintf(stderr, "warning: default route is not ready yet\n");
 	else if (relay && start_relay(&cfg, DEFAULT_DNS1, DEFAULT_DNS2) < 0)
