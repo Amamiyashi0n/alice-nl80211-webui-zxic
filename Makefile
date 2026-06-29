@@ -11,6 +11,11 @@ TARGET_BIN := $(OUT_DIR)/$(TARGET)
 TARGET_RUN := $(OUT_DIR)/$(TARGET).run
 TARGET_SRC := $(SRC_DIR)/$(TARGET).c
 SELF_EXTRACT := tools/make_self_extract.sh
+ASSET_EMBED := tools/embed_asset.py
+AVATAR_SRC := pic/miku_compressed.jpg
+AVATAR_HEADER := $(BUILD_DIR)/avatar_asset.h
+SPONSOR_SRC := pic/sponsor_clean.jpg
+SPONSOR_HEADER := $(BUILD_DIR)/sponsor_asset.h
 WPA_MAIN_OBJ := $(WPA_BUILD)/wpa_supplicant/main.o
 WPA_ENGINE_MAIN_OBJ := $(BUILD_DIR)/wpa_engine_main.o
 WPA_OBJECTS := $(shell find $(WPA_BUILD) -name '*.o' \
@@ -81,7 +86,13 @@ $(BUILD_DIR):
 $(WPA_ENGINE_MAIN_OBJ): $(WPA_MAIN_OBJ) | $(BUILD_DIR)
 	$(OBJCOPY) --redefine-sym main=wpa_engine_main $< $@
 
-$(TARGET_BIN): $(TARGET_SRC) $(WPA_ENGINE_MAIN_OBJ) $(WPA_OBJECTS) | $(OUT_DIR)
+$(AVATAR_HEADER): $(AVATAR_SRC) $(ASSET_EMBED) | $(BUILD_DIR)
+	$(ASSET_EMBED) $(AVATAR_SRC) $@ avatar_image image/jpeg
+
+$(SPONSOR_HEADER): $(SPONSOR_SRC) $(ASSET_EMBED) | $(BUILD_DIR)
+	$(ASSET_EMBED) $(SPONSOR_SRC) $@ sponsor_image image/jpeg
+
+$(TARGET_BIN): $(TARGET_SRC) $(AVATAR_HEADER) $(SPONSOR_HEADER) $(WPA_ENGINE_MAIN_OBJ) $(WPA_OBJECTS) | $(OUT_DIR)
 	$(CC) $(CPPFLAGS) $(ENGINE_WRAP_CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(ENGINE_WRAP_LDFLAGS) -o $@ $(TARGET_SRC) $(WPA_ENGINE_MAIN_OBJ) $(WPA_OBJECTS) $(LDLIBS)
 
 $(TARGET_RUN): $(TARGET_BIN) $(SELF_EXTRACT) | $(OUT_DIR)
@@ -99,6 +110,8 @@ clean:
 	rm -f $(TARGET_BIN)
 	rm -f $(TARGET_RUN)
 	rm -f $(OUT_DIR)/wpa_engine_main.o
+	rm -f $(AVATAR_HEADER)
+	rm -f $(SPONSOR_HEADER)
 	rm -rf $(BUILD_DIR)
 
 distclean:

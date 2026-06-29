@@ -26,7 +26,11 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "../.build/avatar_asset.h"
+#include "../.build/sponsor_asset.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -42,12 +46,14 @@
 #define DEFAULT_DNS_PATH "/mnt/userdata/etc_rw/resolv.conf"
 #define SYSTEM_DNS_PATH "/etc_rw/resolv.conf"
 #define DEFAULT_SAVED_PATH "/mnt/userdata/etc_rw/wpa_mini_saved.conf"
+#define DEFAULT_AUTOCONNECT_STATE "/tmp/wpa_mini_autoconnect.state"
 #define DEFAULT_RELAY_STATE "/tmp/wpa_mini_relay.state"
 #define DEFAULT_RELAY_PIDFILE "/tmp/wpa_mini_relay.pid"
 #define DEFAULT_LAN_ADJUST_STATE "/tmp/wpa_mini_lan_adjust.state"
 #define DEFAULT_UDHCPD_CONF "/etc_rw/udhcpd.conf"
 #define DEFAULT_UDHCPD_LEASES "/etc_rw/udhcpd.leases"
 #define DEFAULT_RUN_PATH "/mnt/userdata/wpa_mini.run"
+#define DEFAULT_BIN_PATH "/mnt/userdata/wpa_mini"
 #define DEFAULT_AUTOSTART_SCRIPT "/mnt/userdata/wpa_mini_autostart.sh"
 #define DEFAULT_AUTOSTART_RC "/etc/rc"
 #define AUTOSTART_BEGIN "# wpa_mini autostart begin"
@@ -195,10 +201,12 @@ struct saved_wifi {
 	int hidden;
 	int route;
 	int relay;
+	int autoconnect;
 };
 
 struct autostart_status {
 	int run_ready;
+	int bin_ready;
 	int script_ready;
 	int hook_ready;
 };
@@ -2095,6 +2103,9 @@ static int load_saved_wifi(struct saved_wifi *items, int max_items)
 			     value[0] == '1' : 1;
 		item.relay = form_value(line, "relay", value, sizeof(value)) &&
 			     value[0] == '1';
+		item.autoconnect = form_value(line, "autoconnect", value,
+					      sizeof(value)) ?
+				   value[0] == '1' : 1;
 		if (item.relay)
 			item.route = 1;
 		if (!valid_psk(item.psk) || !valid_ipv4_or_empty(item.dns1) ||
@@ -2140,9 +2151,10 @@ static int save_saved_wifi(const struct saved_wifi *items, int count)
 		url_encode(psk, sizeof(psk), items[i].psk);
 		url_encode(dns1, sizeof(dns1), items[i].dns1);
 		url_encode(dns2, sizeof(dns2), items[i].dns2);
-		fprintf(fp, "ssid=%s&psk=%s&dns1=%s&dns2=%s&hidden=%d&route=%d&relay=%d\n",
+		fprintf(fp, "ssid=%s&psk=%s&dns1=%s&dns2=%s&hidden=%d&route=%d&relay=%d&autoconnect=%d\n",
 			ssid, psk, dns1, dns2, items[i].hidden ? 1 : 0,
-			items[i].route ? 1 : 0, items[i].relay ? 1 : 0);
+			items[i].route ? 1 : 0, items[i].relay ? 1 : 0,
+			items[i].autoconnect ? 1 : 0);
 	}
 
 	if (fclose(fp) != 0)
@@ -2153,7 +2165,8 @@ static int save_saved_wifi(const struct saved_wifi *items, int count)
 
 static void remember_wifi(const char *ssid, const char *psk,
 			  const char *dns1,
-			  const char *dns2, int hidden, int route, int relay)
+			  const char *dns2, int hidden, int route, int relay,
+			  int autoconnect)
 {
 	struct saved_wifi items[SAVED_WIFI_MAX];
 	struct saved_wifi kept[SAVED_WIFI_MAX];
@@ -2170,6 +2183,7 @@ static void remember_wifi(const char *ssid, const char *psk,
 	next.hidden = hidden ? 1 : 0;
 	next.relay = relay ? 1 : 0;
 	next.route = (route || relay) ? 1 : 0;
+	next.autoconnect = autoconnect ? 1 : 0;
 
 	count = load_saved_wifi(items, SAVED_WIFI_MAX);
 	kept[out++] = next;
@@ -2199,6 +2213,26 @@ static int forget_wifi(const char *ssid)
 	}
 
 	return save_saved_wifi(kept, out);
+}
+
+static int set_saved_autoconnect(const char *ssid, int enabled)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	int count;
+	int i;
+	int changed = 0;
+
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	for (i = 0; i < count; i++) {
+		if (strcmp(items[i].ssid, ssid) != 0)
+			continue;
+		items[i].autoconnect = enabled ? 1 : 0;
+		changed = 1;
+		break;
+	}
+	if (!changed)
+		return -1;
+	return save_saved_wifi(items, count);
 }
 
 static char *read_file_alloc(const char *path, size_t maxsz, size_t *len_out)
@@ -2293,10 +2327,127 @@ static int write_all_fd(int fd, const char *buf, size_t len)
 	return 0;
 }
 
+static int path_is_regular_readable(const char *path)
+{
+	struct stat st;
+
+	if (!path || !*path) {
+		errno = EINVAL;
+		return 0;
+	}
+	if (stat(path, &st) < 0)
+		return 0;
+	if (!S_ISREG(st.st_mode)) {
+		errno = EINVAL;
+		return 0;
+	}
+	return access(path, R_OK) == 0;
+}
+
+static int path_is_same_file(const char *a, const char *b)
+{
+	struct stat sa;
+	struct stat sb;
+
+	if (!a || !b || stat(a, &sa) < 0 || stat(b, &sb) < 0)
+		return 0;
+	return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+static int current_exe_path(char *out, size_t outsz)
+{
+	ssize_t n;
+
+	if (!out || outsz == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	n = readlink("/proc/self/exe", out, outsz - 1);
+	if (n < 0)
+		return -1;
+	out[n] = '\0';
+	return 0;
+}
+
+static int copy_regular_file(const char *src, const char *dst, mode_t mode)
+{
+	unsigned char buf[16384];
+	char tmp[PATH_MAX];
+	struct stat st;
+	ssize_t n;
+	int in = -1;
+	int out = -1;
+	int saved_errno;
+	int rc = -1;
+
+	if (!path_is_regular_readable(src))
+		return -1;
+	if (stat(src, &st) < 0)
+		return -1;
+	if (!S_ISREG(st.st_mode)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (path_is_same_file(src, dst))
+		return chmod(dst, mode);
+	if (mkdir_parent(dst) < 0)
+		return -1;
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", dst, (long)getpid()) >=
+	    (int)sizeof(tmp)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	in = open(src, O_RDONLY);
+	if (in < 0)
+		goto out;
+	out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+	if (out < 0)
+		goto out;
+
+	for (;;) {
+		n = read(in, buf, sizeof(buf));
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			goto out;
+		}
+		if (n == 0)
+			break;
+		if (write_all_fd(out, (const char *)buf, (size_t)n) < 0)
+			goto out;
+	}
+
+	if (fsync(out) < 0)
+		goto out;
+	if (close(out) < 0) {
+		out = -1;
+		goto out;
+	}
+	out = -1;
+	if (chmod(tmp, mode) < 0)
+		goto out;
+	if (rename(tmp, dst) < 0)
+		goto out;
+	rc = 0;
+
+out:
+	saved_errno = errno;
+	if (out >= 0)
+		close(out);
+	if (in >= 0)
+		close(in);
+	if (rc < 0)
+		unlink(tmp);
+	errno = saved_errno;
+	return rc;
+}
+
 static void get_autostart_status(struct autostart_status *st)
 {
 	memset(st, 0, sizeof(*st));
 	st->run_ready = access(DEFAULT_RUN_PATH, R_OK) == 0;
+	st->bin_ready = access(DEFAULT_BIN_PATH, X_OK) == 0;
 	st->script_ready = access(DEFAULT_AUTOSTART_SCRIPT, R_OK) == 0;
 	st->hook_ready = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN) &&
 			 file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_END);
@@ -2308,16 +2459,92 @@ static void remount_userdata_rw(void)
 	       "mount -o remount,rw /mnt/userdata 2>/dev/null");
 }
 
+static int install_autostart_payload(const struct app_config *cfg,
+				     int *payload_kind)
+{
+	const char *run_src;
+	char exe[PATH_MAX];
+	int run_errno = 0;
+
+	if (payload_kind)
+		*payload_kind = 0;
+	remount_userdata_rw();
+
+	run_src = getenv("WPA_MINI_RUN_SOURCE");
+	if (path_is_regular_readable(run_src)) {
+		if (copy_regular_file(run_src, DEFAULT_RUN_PATH, 0755) == 0) {
+			log_msg(cfg, "autostart payload copied run source=%s dst=%s",
+				run_src, DEFAULT_RUN_PATH);
+			if (payload_kind)
+				*payload_kind = 1;
+			sync();
+			return 0;
+		}
+		run_errno = errno;
+		log_msg(cfg, "autostart run payload copy failed source=%s errno=%d",
+			run_src, errno);
+	}
+
+	if (current_exe_path(exe, sizeof(exe)) == 0 &&
+	    path_is_regular_readable(exe)) {
+		if (copy_regular_file(exe, DEFAULT_BIN_PATH, 0755) == 0) {
+			log_msg(cfg, "autostart payload copied binary source=%s dst=%s",
+				exe, DEFAULT_BIN_PATH);
+			if (payload_kind)
+				*payload_kind = 2;
+			sync();
+			return 0;
+		}
+		log_msg(cfg, "autostart binary payload copy failed source=%s errno=%d",
+			exe, errno);
+	}
+
+	if (run_errno)
+		errno = run_errno;
+	return -1;
+}
+
+static void write_autostart_args(FILE *fp, const struct app_config *cfg)
+{
+	fprintf(fp, " -w -i ");
+	shell_quote(fp, cfg->iface);
+	fprintf(fp, " -L %d -c ", cfg->port);
+	shell_quote(fp, cfg->conf);
+	fprintf(fp, " -C ");
+	shell_quote(fp, cfg->ctrl_dir);
+	fprintf(fp, " -D ");
+	shell_quote(fp, cfg->driver);
+	fprintf(fp, " -P ");
+	shell_quote(fp, cfg->pidfile);
+	fprintf(fp, " -r ");
+	shell_quote(fp, cfg->dns_path);
+	fprintf(fp, " -l ");
+	shell_quote(fp, cfg->log_path);
+	fprintf(fp, " -u ");
+	shell_quote(fp, cfg->udhcpc);
+}
+
+static void write_autostart_exec_block(FILE *fp, const char *var,
+				       int use_shell,
+				       const struct app_config *cfg)
+{
+	fprintf(fp, "if [ %s \"$%s\" ]; then\n", use_shell ? "-r" : "-x", var);
+	fprintf(fp, "\texec ");
+	if (use_shell)
+		fprintf(fp, "/bin/sh ");
+	fprintf(fp, "\"$%s\"", var);
+	write_autostart_args(fp, cfg);
+	fprintf(fp, "\nfi\n");
+}
+
 static int write_autostart_script(const struct app_config *cfg)
 {
 	int fd;
+	int payload_kind = 0;
 	FILE *fp;
 
-	remount_userdata_rw();
-	if (access(DEFAULT_RUN_PATH, R_OK) != 0) {
-		errno = ENOENT;
+	if (install_autostart_payload(cfg, &payload_kind) < 0)
 		return -1;
-	}
 	if (mkdir_parent(DEFAULT_AUTOSTART_SCRIPT) < 0)
 		return -1;
 
@@ -2336,25 +2563,20 @@ static int write_autostart_script(const struct app_config *cfg)
 	fprintf(fp, "PATH=/sbin:/bin:/usr/sbin:/usr/bin\n");
 	fprintf(fp, "mount -o remount,exec /tmp 2>/dev/null || true\n");
 	fprintf(fp, "mount -o remount,rw,exec /mnt/userdata 2>/dev/null || mount -o remount,rw /mnt/userdata 2>/dev/null || true\n");
-	fprintf(fp, "exec /bin/sh ");
+	fprintf(fp, "RUN=");
 	shell_quote(fp, DEFAULT_RUN_PATH);
-	fprintf(fp, " -w -i ");
-	shell_quote(fp, cfg->iface);
-	fprintf(fp, " -L %d -c ", cfg->port);
-	shell_quote(fp, cfg->conf);
-	fprintf(fp, " -C ");
-	shell_quote(fp, cfg->ctrl_dir);
-	fprintf(fp, " -D ");
-	shell_quote(fp, cfg->driver);
-	fprintf(fp, " -P ");
-	shell_quote(fp, cfg->pidfile);
-	fprintf(fp, " -r ");
-	shell_quote(fp, cfg->dns_path);
-	fprintf(fp, " -l ");
-	shell_quote(fp, cfg->log_path);
-	fprintf(fp, " -u ");
-	shell_quote(fp, cfg->udhcpc);
+	fprintf(fp, "\nBIN=");
+	shell_quote(fp, DEFAULT_BIN_PATH);
 	fprintf(fp, "\n");
+	if (payload_kind == 2) {
+		write_autostart_exec_block(fp, "BIN", 0, cfg);
+		write_autostart_exec_block(fp, "RUN", 1, cfg);
+	} else {
+		write_autostart_exec_block(fp, "RUN", 1, cfg);
+		write_autostart_exec_block(fp, "BIN", 0, cfg);
+	}
+	fprintf(fp, "echo \"missing wpa_mini startup payload\" >&2\n");
+	fprintf(fp, "exit 127\n");
 
 	if (fclose(fp) != 0)
 		return -1;
@@ -5582,6 +5804,46 @@ static int scan_has_rows(const char *text)
 	return p && p[1];
 }
 
+static int scan_contains_ssid(const char *scan_text, const char *ssid)
+{
+	char *copy;
+	char *save;
+	char *line;
+	int found = 0;
+
+	if (!scan_text || !ssid || !*ssid)
+		return 0;
+	copy = malloc(SCAN_TEXT_MAX);
+	if (!copy)
+		return 0;
+	snprintf(copy, SCAN_TEXT_MAX, "%s", scan_text);
+	line = strtok_r(copy, "\n", &save);
+	while ((line = strtok_r(NULL, "\n", &save)) != NULL) {
+		char *fields[5];
+		char *p = line;
+		int i;
+		char decoded_ssid[96];
+
+		for (i = 0; i < 4; i++) {
+			fields[i] = p;
+			p = strchr(p, '\t');
+			if (!p)
+				break;
+			*p++ = '\0';
+		}
+		if (i < 4)
+			continue;
+		fields[4] = p;
+		decode_escaped_ssid(decoded_ssid, sizeof(decoded_ssid), fields[4]);
+		if (strcmp(decoded_ssid, ssid) == 0) {
+			found = 1;
+			break;
+		}
+	}
+	free(copy);
+	return found;
+}
+
 static int run_scan(const struct app_config *cfg, char *out, size_t outsz)
 {
 	char *reply;
@@ -5636,6 +5898,165 @@ out:
 	return ret;
 }
 
+static int connect_wifi_internal(const struct app_config *cfg,
+				 const char *ssid, const char *psk,
+				 const char *dns1, const char *dns2,
+				 int hidden, int use_route, int relay)
+{
+	char use_dns1[64];
+	char use_dns2[64];
+
+	snprintf(use_dns1, sizeof(use_dns1), "%s",
+		 dns1 && dns1[0] ? dns1 : DEFAULT_DNS1);
+	snprintf(use_dns2, sizeof(use_dns2), "%s",
+		 dns2 && dns2[0] ? dns2 : DEFAULT_DNS2);
+	if (relay)
+		use_route = 1;
+	log_msg(cfg, "connect internal ssid=%s hidden=%d route=%d relay=%d dns1=%s dns2=%s",
+		ssid, hidden, use_route, relay, use_dns1, use_dns2);
+
+	if (!valid_ipv4_or_empty(use_dns1) || !valid_ipv4_or_empty(use_dns2)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (write_config(cfg->conf, cfg->ctrl_dir, ssid, psk, hidden) < 0)
+		return -1;
+
+	stop_dhcp(cfg);
+	stop_relay(cfg);
+	deconfigure_iface(cfg);
+
+	if (start_engine_process(cfg) < 0)
+		return -1;
+	if (wait_wpa_completed(cfg, 20000) < 0) {
+		stop_engine(cfg);
+		return -1;
+	}
+	if (start_dhcp(cfg, use_dns1, use_dns2, use_route) < 0)
+		return -1;
+	if (wait_ipv4_ready(cfg, 8000) < 0)
+		return -1;
+	if (use_route && wait_default_route_ready(cfg, 5000) < 0)
+		return -1;
+	if (relay && start_relay(cfg, use_dns1, use_dns2) < 0)
+		return -1;
+	return 0;
+}
+
+static int autoconnect_recent(const char *ssid)
+{
+	FILE *fp;
+	char line[512];
+	char saved_enc[288];
+	char saved[96];
+	long stamp = 0;
+	long now = (long)time(NULL);
+
+	fp = fopen(DEFAULT_AUTOCONNECT_STATE, "r");
+	if (!fp)
+		return 0;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return 0;
+	}
+	fclose(fp);
+	if (sscanf(line, "%287s %ld", saved_enc, &stamp) != 2)
+		return 0;
+	url_decode(saved, sizeof(saved), saved_enc, strlen(saved_enc));
+	if (strcmp(saved, ssid) != 0)
+		return 0;
+	return stamp > 0 && now > 0 && now - stamp < 60;
+}
+
+static void mark_autoconnect_attempt(const char *ssid)
+{
+	FILE *fp;
+	char encoded[288];
+
+	fp = fopen(DEFAULT_AUTOCONNECT_STATE, "w");
+	if (!fp)
+		return;
+	url_encode(encoded, sizeof(encoded), ssid);
+	fprintf(fp, "%s %ld\n", encoded, (long)time(NULL));
+	fclose(fp);
+	chmod(DEFAULT_AUTOCONNECT_STATE, 0600);
+}
+
+static int start_autoconnect_worker(const struct app_config *cfg,
+				    const struct saved_wifi *item)
+{
+	pid_t pid;
+
+	if (autoconnect_recent(item->ssid)) {
+		log_msg(cfg, "autoconnect skipped recent ssid=%s", item->ssid);
+		return 0;
+	}
+	mark_autoconnect_attempt(item->ssid);
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		close_inherited_fds();
+		log_msg(cfg, "autoconnect worker start ssid=%s", item->ssid);
+		if (connect_wifi_internal(cfg, item->ssid, item->psk,
+					  item->dns1, item->dns2,
+					  item->hidden, item->route,
+					  item->relay) == 0) {
+			remember_wifi(item->ssid, item->psk, item->dns1,
+				      item->dns2, item->hidden, item->route,
+				      item->relay, item->autoconnect);
+			log_msg(cfg, "autoconnect worker completed ssid=%s",
+				item->ssid);
+			_exit(0);
+		}
+		log_msg(cfg, "autoconnect worker failed ssid=%s errno=%d",
+			item->ssid, errno);
+		_exit(1);
+	}
+	log_msg(cfg, "autoconnect worker pid=%ld ssid=%s", (long)pid,
+		item->ssid);
+	return 1;
+}
+
+static int maybe_start_autoconnect(const struct app_config *cfg,
+				   struct runtime_status *st,
+				   char *message, size_t messagesz)
+{
+	struct saved_wifi items[SAVED_WIFI_MAX];
+	char *scan;
+	int count;
+	int i;
+	int ret = 0;
+
+	if (runtime_is_connected(st) || st->engine_running)
+		return 0;
+	count = load_saved_wifi(items, SAVED_WIFI_MAX);
+	if (count <= 0)
+		return 0;
+	scan = calloc(1, SCAN_TEXT_MAX);
+	if (!scan)
+		return 0;
+	if (run_scan(cfg, scan, SCAN_TEXT_MAX) < 0) {
+		free(scan);
+		return 0;
+	}
+	for (i = 0; i < count; i++) {
+		if (!items[i].autoconnect)
+			continue;
+		if (!scan_contains_ssid(scan, items[i].ssid))
+			continue;
+		ret = start_autoconnect_worker(cfg, &items[i]);
+		if (ret > 0 && message && messagesz) {
+			snprintf(message, messagesz,
+				 "发现已保存 WiFi「%s」，正在自动连接。",
+				 items[i].ssid);
+		}
+		break;
+	}
+	free(scan);
+	return ret;
+}
+
 static int send_all(const struct app_config *cfg, int fd,
 		    const char *buf, size_t len, const char *label)
 {
@@ -5682,6 +6103,33 @@ static void http_send(int fd, const struct app_config *cfg,
 	if (send_all(cfg, fd, header, (size_t)header_len, "header") < 0)
 		return;
 	send_all(cfg, fd, body, body_len, "body");
+}
+
+static void http_send_data(int fd, const struct app_config *cfg,
+			   int code, const char *status,
+			   const char *ctype, const unsigned char *data,
+			   size_t data_len, const char *cache)
+{
+	char header[320];
+	int header_len;
+
+	header_len = snprintf(header, sizeof(header),
+			      "HTTP/1.1 %d %s\r\n"
+			      "Content-Type: %s\r\n"
+			      "Content-Length: %lu\r\n"
+			      "Connection: close\r\n"
+			      "Cache-Control: %s\r\n"
+			      "\r\n",
+			      code, status, ctype, (unsigned long)data_len,
+			      cache ? cache : "no-store");
+	if (header_len < 0)
+		return;
+
+	log_msg(cfg, "http data response code=%d status=%s body=%lu",
+		code, status, (unsigned long)data_len);
+	if (send_all(cfg, fd, header, (size_t)header_len, "header") < 0)
+		return;
+	send_all(cfg, fd, (const char *)data, data_len, "data");
 }
 
 static void http_redirect(int fd, const struct app_config *cfg,
@@ -5789,19 +6237,25 @@ static void build_saved_html(char *out, size_t outsz)
 			html_escape(esc_ssid, sizeof(esc_ssid), items[i].ssid);
 			html_escape(esc_dns1, sizeof(esc_dns1), items[i].dns1);
 			html_escape(esc_dns2, sizeof(esc_dns2), items[i].dns2);
-			buf_append(out, outsz,
-				   "<div class=\"saved\"><div><div class=\"v\">%s</div>"
-				   "<div class=\"hint\">DNS %s / %s%s%s</div></div>"
-				   "<div class=\"savedact\">"
-				   "<form method=\"post\" action=\"/connect_saved\"><input type=\"hidden\" name=\"idx\" value=\"%d\"><button type=\"submit\">连接</button></form>"
-				   "<form method=\"post\" action=\"/forget\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><button class=\"alt\" type=\"submit\">删除</button></form>"
-				   "</div></div>",
-				   esc_ssid,
-				   esc_dns1[0] ? esc_dns1 : DEFAULT_DNS1,
-				   esc_dns2[0] ? esc_dns2 : DEFAULT_DNS2,
-				   items[i].hidden ? " · 隐藏" : "",
-				   items[i].relay ? " · 中继" : "",
-				   i, esc_ssid);
+				buf_append(out, outsz,
+					   "<div class=\"saved\"><div><div class=\"v\">%s</div>"
+					   "<div class=\"hint\">DNS %s / %s%s%s%s</div></div>"
+					   "<div class=\"savedact\">"
+					   "<form method=\"post\" action=\"/connect_saved\"><input type=\"hidden\" name=\"idx\" value=\"%d\"><button type=\"submit\">连接</button></form>"
+					   "<form method=\"post\" action=\"/autoconnect_saved\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><input type=\"hidden\" name=\"enabled\" value=\"%d\"><button class=\"alt\" type=\"submit\">%s</button></form>"
+					   "<form method=\"post\" action=\"/forget\"><input type=\"hidden\" name=\"ssid\" value=\"%s\"><button class=\"alt\" type=\"submit\">删除</button></form>"
+					   "</div></div>",
+					   esc_ssid,
+					   esc_dns1[0] ? esc_dns1 : DEFAULT_DNS1,
+					   esc_dns2[0] ? esc_dns2 : DEFAULT_DNS2,
+					   items[i].hidden ? " · 隐藏" : "",
+					   items[i].relay ? " · 中继" : "",
+					   items[i].autoconnect ? " · 范围内自动连接" :
+					   " · 不自动连接",
+					   i, esc_ssid, items[i].autoconnect ? 0 : 1,
+					   items[i].autoconnect ? "关闭自动连接" :
+					   "开启自动连接",
+					   esc_ssid);
 		}
 	}
 	buf_append(out, outsz, "</div></section>");
@@ -5812,12 +6266,22 @@ static void build_autostart_html(char *out, size_t outsz)
 	struct autostart_status st;
 	const char *label;
 	const char *detail;
+	const char *payload;
 
 	if (outsz)
 		out[0] = '\0';
 
 	get_autostart_status(&st);
-	if (st.run_ready && st.script_ready && st.hook_ready) {
+	if (st.run_ready && st.bin_ready)
+		payload = ".run 与二进制已就绪";
+	else if (st.run_ready)
+		payload = ".run 已就绪";
+	else if (st.bin_ready)
+		payload = "二进制已就绪";
+	else
+		payload = "待安装";
+
+	if ((st.run_ready || st.bin_ready) && st.script_ready && st.hook_ready) {
 		label = "已启用";
 		detail = "开机会从 /mnt/userdata 启动 WebUI";
 	} else if (st.script_ready || st.hook_ready) {
@@ -5825,24 +6289,24 @@ static void build_autostart_html(char *out, size_t outsz)
 		detail = "启动脚本或系统钩子不完整，可重新启用修复";
 	} else {
 		label = "未启用";
-		detail = st.run_ready ? "可写入开机启动项" :
-			 "缺少 /mnt/userdata/wpa_mini.run";
+		detail = "点击启用时会自动复制当前启动文件";
 	}
 
 	buf_append(out, outsz,
 		   "<section class=\"panel\"><div class=\"formtop\"><div>"
 		   "<div class=\"title\">开机自启动</div>"
-		   "<div class=\"hint\">启动包：" DEFAULT_RUN_PATH "</div>"
+		   "<div class=\"hint\">持久路径：" DEFAULT_RUN_PATH " / " DEFAULT_BIN_PATH "</div>"
 		   "</div></div><div class=\"pad\"><div class=\"grid\">"
 		   "<div class=\"kv\"><div class=\"k\">状态</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">说明</div><div class=\"v\">%s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">启动文件</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">启动脚本</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">系统钩子</div><div class=\"v\">%s</div></div>"
 		   "</div><div class=\"actions\">"
 		   "<form method=\"post\" action=\"/autostart_on\"><button type=\"submit\">启用自启动</button></form>"
 		   "<form method=\"post\" action=\"/autostart_off\"><button class=\"alt\" type=\"submit\">关闭自启动</button></form>"
 		   "</div></div></section>",
-		   label, detail,
+		   label, detail, payload,
 		   st.script_ready ? "已写入" : "未写入",
 		   st.hook_ready ? "已安装" : "未安装");
 }
@@ -6143,7 +6607,8 @@ static void build_system_text(const struct app_config *cfg, char *out,
 enum web_page {
 	WEB_PAGE_HOME,
 	WEB_PAGE_INTERFACES,
-	WEB_PAGE_SYSTEM
+	WEB_PAGE_SYSTEM,
+	WEB_PAGE_ABOUT
 };
 
 static const char *nav_active(enum web_page current, enum web_page item)
@@ -6198,16 +6663,18 @@ static void append_page_start(char *body, size_t bodysz,
 		   "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:700}"
 		   ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}button.alt,button.scan{background:#fff;color:#2f7d4f}"
 		   ".tablewrap{overflow:auto}.saved{border:1px solid #edf2ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:800;color:#1d3b29}.tag{display:inline-block;margin-left:5px;border-radius:5px;background:#e4f1e8;color:#286542;padding:2px 5px;font-size:11px}.focusrow{background:#f0f8f2}.defrow{background:#f8fbf3}.tinylink{font-size:12px;font-weight:800;color:#2f7d4f;border:1px solid #d1e5d7;border-radius:999px;padding:6px 9px;background:#fbfffc}"
+		   ".about{display:grid;grid-template-columns:148px minmax(0,1fr);gap:18px;align-items:center}.avatar{width:132px;height:132px;border-radius:8px;object-fit:cover;border:1px solid #d9e5dc;box-shadow:0 8px 22px rgba(24,37,29,.08)}.aboutname{font-size:20px;font-weight:800;margin-bottom:7px}.signature{margin-top:13px;color:#2f5f40;font-size:15px;font-weight:800;line-height:1.7}.repo{display:inline-block;margin-top:13px;color:#1f6d42;font-weight:800;word-break:break-all}.supportgrid{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:14px}.supportcard{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:14px;min-width:0}.supporttitle{font-size:15px;font-weight:800;margin-bottom:7px}.supportlink{display:inline-block;margin-top:12px;border-radius:6px;background:#2f7d4f;color:#fff;font-weight:800;padding:10px 13px}.qrbox{display:flex;justify-content:center}.qr{display:block;width:100%%;max-width:190px;height:auto;border-radius:8px;border:1px solid #e5dff0;background:#fff;box-shadow:0 8px 18px rgba(24,37,29,.06)}"
 		   "table{width:100%%;border-collapse:collapse;font-size:13px;min-width:680px}th,td{text-align:left;border-bottom:1px solid #e7eee8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:800}"
-		   "@media(max-width:860px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc;padding:12px}.brandbox{padding-bottom:6px}.nav{flex-direction:row;overflow:auto}.nav a{white-space:nowrap}.sidecard{display:none}main.page{padding:16px}.topline{align-items:flex-start}.layout,.grid,.twocol,.summary{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}.topmeta{text-align:left}}"
+		   "@media(max-width:860px){.shell{display:block}.side{position:static;height:auto;border-right:0;border-bottom:1px solid #dbe8dc;padding:12px}.brandbox{padding-bottom:6px}.nav{flex-direction:row;overflow:auto}.nav a{white-space:nowrap}.sidecard{display:none}main.page{padding:16px}.topline{align-items:flex-start}.layout,.grid,.twocol,.summary,.about,.supportgrid{grid-template-columns:1fr}.saved{align-items:flex-start;flex-direction:column}.topmeta{text-align:left}.qr{max-width:220px}}"
 		   "</style></head><body><div class=\"shell\"><aside class=\"side\">"
 		   "<div class=\"brandbox\"><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div>"
-		   "<nav class=\"nav\"><a class=\"%s\" href=\"/\">控制台</a><a class=\"%s\" href=\"/interfaces\">网络接口</a><a class=\"%s\" href=\"/system_page\">系统信息</a></nav>"
+		   "<nav class=\"nav\"><a class=\"%s\" href=\"/\">控制台</a><a class=\"%s\" href=\"/interfaces\">网络接口</a><a class=\"%s\" href=\"/system_page\">系统信息</a><a class=\"%s\" href=\"/about\">关于</a></nav>"
 		   "<div class=\"sidecard\"><div class=\"pill\">%s</div><div class=\"hint\">接口 %s</div><div class=\"hint\">SSID %s</div></div>"
 		   "</aside><main class=\"page\"><div class=\"topline\"><div><div class=\"h1\">%s</div><div class=\"hint\">%s</div></div><div class=\"topmeta\"><div class=\"pill\">%s</div><div class=\"hint\">IP %s</div></div></div>",
 		   esc_title, state_color, nav_active(page, WEB_PAGE_HOME),
 		   nav_active(page, WEB_PAGE_INTERFACES),
 		   nav_active(page, WEB_PAGE_SYSTEM),
+		   nav_active(page, WEB_PAGE_ABOUT),
 		   state_label, esc_iface, esc_ssid[0] ? esc_ssid : "-",
 		   esc_title, esc_subtitle, state_label,
 		   esc_ip[0] ? esc_ip : "-");
@@ -6327,6 +6794,7 @@ static void append_home_content(char *body, size_t bodysz,
 			   "<div class=\"twocol\"><div><label>DNS 1</label><input name=\"dns1\" value=\"" DEFAULT_DNS1 "\" inputmode=\"decimal\"></div>"
 			   "<div><label>DNS 2</label><input name=\"dns2\" value=\"" DEFAULT_DNS2 "\" inputmode=\"decimal\"></div></div>"
 			   "<div class=\"check\"><input id=\"hidden\" name=\"hidden\" value=\"1\" type=\"checkbox\"><label for=\"hidden\">隐藏 SSID</label></div>"
+			   "<div class=\"check\"><input id=\"autoconnect\" name=\"autoconnect\" value=\"1\" type=\"checkbox\" checked><label for=\"autoconnect\">这个 WiFi 在范围内时自动连接</label></div>"
 			   "<div class=\"check\"><input id=\"relay\" name=\"relay\" value=\"1\" type=\"checkbox\"><label for=\"relay\">连接后共享网络给热点和 USB 设备</label></div>"
 			   "<div class=\"actions\"><button type=\"submit\">连接</button></div></form>"
 			   "<div class=\"actions\"><form method=\"post\" action=\"/scan\"><button class=\"scan\" type=\"submit\">扫描 WiFi</button></form>"
@@ -6371,6 +6839,8 @@ static void render_page(int fd, const struct app_config *cfg,
 	char *saved_html;
 	char *autostart_html;
 	char *body;
+	char auto_msg[256];
+	const char *display_message = message;
 
 	log_msg(cfg, "render home page message=%s scan=%d",
 		message ? message : "", scan_text && *scan_text ? 1 : 0);
@@ -6390,11 +6860,18 @@ static void render_page(int fd, const struct app_config *cfg,
 	}
 
 	get_runtime_status(cfg, &st);
+	auto_msg[0] = '\0';
+	if (!message && (!scan_text || !*scan_text) &&
+	    maybe_start_autoconnect(cfg, &st, auto_msg, sizeof(auto_msg)) > 0) {
+		display_message = auto_msg;
+		get_runtime_status(cfg, &st);
+	}
 	build_scan_html(scan_text, scan_html, SCAN_HTML_MAX);
 	build_saved_html(saved_html, SAVED_HTML_MAX);
 	build_autostart_html(autostart_html, AUTOSTART_HTML_MAX);
 	append_page_start(body, PAGE_BODY_MAX, cfg, &st, WEB_PAGE_HOME,
-			  "控制台", "连接 WiFi、扫描网络、管理已保存配置", message);
+			  "控制台", "连接 WiFi、扫描网络、管理已保存配置",
+			  display_message);
 	append_home_content(body, PAGE_BODY_MAX, cfg, &st, scan_html,
 			    saved_html, autostart_html);
 	append_page_end(body, PAGE_BODY_MAX);
@@ -6458,6 +6935,60 @@ static void render_system_page(int fd, const struct app_config *cfg)
 	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
 	free(content);
 	free(body);
+}
+
+static void render_about_page(int fd, const struct app_config *cfg)
+{
+	struct runtime_status st;
+	char *body;
+
+	log_msg(cfg, "render about page");
+	body = calloc(1, PAGE_BODY_MAX);
+	if (!body) {
+		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
+			  "out of memory\n");
+		return;
+	}
+	get_runtime_status(cfg, &st);
+	append_page_start(body, PAGE_BODY_MAX, cfg, &st, WEB_PAGE_ABOUT,
+			  "关于", "项目信息与署名", NULL);
+	buf_append(body, PAGE_BODY_MAX,
+		   "<section class=\"panel\"><div class=\"pad about\">"
+		   "<img class=\"avatar\" src=\"/avatar.jpg\" alt=\"avatar\">"
+		   "<div><div class=\"aboutname\">alice-nl80211-webui-zxic</div>"
+		   "<div class=\"hint\">轻量 WiFi STA WebUI 与 WPA Mini 运行环境</div>"
+		   "<a class=\"repo\" href=\"https://github.com/Amamiyashi0n/alice-nl80211-webui-zxic\">"
+		   "github.com/Amamiyashi0n/alice-nl80211-webui-zxic</a>"
+		   "<div class=\"signature\">世间自有尘寰在，我亦独吟游且歌。</div>"
+		   "</div></div></section>"
+		   "<section class=\"panel\"><div class=\"formtop\"><div class=\"title\">赞助支持</div>"
+		   "<div class=\"hint\">链接或扫码均可</div></div><div class=\"pad supportgrid\">"
+		   "<div class=\"supportcard\"><div class=\"supporttitle\">爱发电链接赞助</div>"
+		   "<div class=\"hint\">打开爱发电页面支持项目维护。</div>"
+		   "<a class=\"supportlink\" href=\"https://ifdian.net/a/amamiyashion\">"
+		   "前往爱发电</a>"
+		   "<a class=\"repo\" href=\"https://ifdian.net/a/amamiyashion\">"
+		   "ifdian.net/a/amamiyashion</a></div>"
+		   "<div class=\"supportcard\"><div class=\"supporttitle\">微信 / 支付宝扫码</div>"
+		   "<div class=\"qrbox\"><img class=\"qr\" src=\"/sponsor.jpg\" alt=\"sponsor qrcode\"></div>"
+		   "</div></div></section>");
+	append_page_end(body, PAGE_BODY_MAX);
+	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
+	free(body);
+}
+
+static void render_avatar(int fd, const struct app_config *cfg)
+{
+	http_send_data(fd, cfg, 200, "OK", avatar_image_mime,
+		       avatar_image_data, avatar_image_size,
+		       "public, max-age=86400");
+}
+
+static void render_sponsor_image(int fd, const struct app_config *cfg)
+{
+	http_send_data(fd, cfg, 200, "OK", sponsor_image_mime,
+		       sponsor_image_data, sponsor_image_size,
+		       "public, max-age=86400");
 }
 
 static void render_status(int fd, const struct app_config *cfg)
@@ -6600,7 +7131,7 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 				 const char *ssid, const char *psk,
 				 const char *dns1,
 				 const char *dns2, int hidden, int use_route,
-				 int relay, int remember)
+				 int relay, int remember, int autoconnect)
 {
 	char use_dns1[64];
 	char use_dns2[64];
@@ -6643,7 +7174,7 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 
 	if (remember)
 		remember_wifi(ssid, psk, use_dns1, use_dns2, hidden,
-			      use_route, relay);
+			      use_route, relay, autoconnect);
 
 	if (start_dhcp(cfg, use_dns1, use_dns2, use_route) < 0) {
 		render_page(fd, cfg, "WiFi 已连接，但 udhcpc 启动失败。", NULL);
@@ -6681,6 +7212,7 @@ static void handle_connect(int fd, const struct app_config *cfg,
 	int hidden;
 	int use_route;
 	int relay;
+	int autoconnect;
 
 	form_value(body, "ssid", ssid, sizeof(ssid));
 	form_value(body, "psk", psk, sizeof(psk));
@@ -6688,9 +7220,11 @@ static void handle_connect(int fd, const struct app_config *cfg,
 	form_value(body, "dns2", dns2, sizeof(dns2));
 	hidden = form_value(body, "hidden", value, sizeof(value)) && value[0];
 	relay = form_value(body, "relay", value, sizeof(value)) && value[0];
+	autoconnect = form_value(body, "autoconnect", value, sizeof(value)) &&
+		      value[0];
 	use_route = 1;
 	connect_wifi_request(fd, cfg, ssid, psk, dns1, dns2, hidden,
-			     use_route, relay, 1);
+			     use_route, relay, 1, autoconnect);
 }
 
 static void handle_connect_saved(int fd, const struct app_config *cfg,
@@ -6722,7 +7256,7 @@ static void handle_connect_saved(int fd, const struct app_config *cfg,
 	}
 	connect_wifi_request(fd, cfg, items[idx].ssid, items[idx].psk,
 			     items[idx].dns1, items[idx].dns2, items[idx].hidden,
-			     1, items[idx].relay, 1);
+			     1, items[idx].relay, 1, items[idx].autoconnect);
 }
 
 static void handle_forget(int fd, const struct app_config *cfg,
@@ -6733,6 +7267,21 @@ static void handle_forget(int fd, const struct app_config *cfg,
 	form_value(body, "ssid", ssid, sizeof(ssid));
 	if (ssid[0])
 		forget_wifi(ssid);
+	http_redirect(fd, cfg, "/");
+}
+
+static void handle_autoconnect_saved(int fd, const struct app_config *cfg,
+				     const char *body)
+{
+	char ssid[96];
+	char value[16];
+	int enabled;
+
+	form_value(body, "ssid", ssid, sizeof(ssid));
+	form_value(body, "enabled", value, sizeof(value));
+	enabled = value[0] == '1';
+	if (ssid[0])
+		set_saved_autoconnect(ssid, enabled);
 	http_redirect(fd, cfg, "/");
 }
 
@@ -6779,7 +7328,7 @@ static void handle_autostart_on(int fd, const struct app_config *cfg)
 	if (write_autostart_script(cfg) < 0) {
 		log_msg(cfg, "autostart script write failed errno=%d", errno);
 		render_page(fd, cfg,
-			    "自启动脚本写入失败，请确认 /mnt/userdata/wpa_mini.run 存在并可执行。",
+			    "自启动安装失败，请确认 /mnt/userdata 可写，并且当前启动文件仍可读取。",
 			    NULL);
 		return;
 	}
@@ -7009,6 +7558,15 @@ static void handle_client(int fd, const struct app_config *cfg)
 	} else if (strcmp(method, "GET") == 0 &&
 		   strcmp(path, "/system_page") == 0) {
 		render_system_page(fd, cfg);
+	} else if (strcmp(method, "GET") == 0 &&
+		   strcmp(path, "/about") == 0) {
+		render_about_page(fd, cfg);
+	} else if (strcmp(method, "GET") == 0 &&
+		   strcmp(path, "/avatar.jpg") == 0) {
+		render_avatar(fd, cfg);
+	} else if (strcmp(method, "GET") == 0 &&
+		   strcmp(path, "/sponsor.jpg") == 0) {
+		render_sponsor_image(fd, cfg);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/status") == 0) {
 		render_status(fd, cfg);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/system") == 0) {
@@ -7031,6 +7589,9 @@ static void handle_client(int fd, const struct app_config *cfg)
 	} else if (strcmp(method, "POST") == 0 &&
 		   strcmp(path, "/connect_saved") == 0) {
 		handle_connect_saved(fd, cfg, body);
+	} else if (strcmp(method, "POST") == 0 &&
+		   strcmp(path, "/autoconnect_saved") == 0) {
+		handle_autoconnect_saved(fd, cfg, body);
 	} else if (strcmp(method, "POST") == 0 &&
 		   strcmp(path, "/forget") == 0) {
 		handle_forget(fd, cfg, body);

@@ -8,7 +8,7 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `508016` 字节，`wpa_mini.run` 大小为 `352734` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎链接进程序内部，不需要额外交付 `wpa_cli` 或外部 `wpa_supplicant`。
+当前生成的 `wpa_mini` 大小为 `610640` 字节，`wpa_mini.run` 大小为 `358259` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎、WebUI 头像和赞助二维码资源链接进程序内部，不需要额外交付 `wpa_cli`、外部 `wpa_supplicant` 或图片文件。
 
 ## 功能
 
@@ -18,6 +18,7 @@
 - 扫描周围 WiFi。
 - 连接 WPA/WPA2-PSK 网络。
 - 连接成功后记忆 WiFi，并可在 WebUI 一键重连或删除。
+- 已保存 WiFi 可设置“在范围内自动连接”；未连接时 WebUI 会扫描附近网络，命中已保存且开启自动连接的 SSID 后自动发起连接。
 - BSSID 仅在扫描结果和状态中只读显示，连接时由系统自动选择具体 AP。
 - 调用目标系统 `/sbin/udhcpc` 获取 DHCP。
 - 写入 DNS 到 `/mnt/userdata/etc_rw/resolv.conf`，默认使用阿里 `223.5.5.5` 和腾讯 `119.29.29.29`。
@@ -27,7 +28,8 @@
 - 开启共享时只向下层客户端提供普通网关和 DNS，不强制抢占客户端已有更高优先级网络。
 - 开启共享时如果检测到上游 WiFi 和热点/USB 网段冲突，会从 `192.168.0.0/24` 到 `192.168.255.0/24` 自动选择一个未占用网段，并继续开启共享。
 - WebUI 可启用或关闭开机自启动。
-- WebUI 拆分为控制台、网络接口、系统信息三个页面，只读展示目标系统状态、全部网络接口、路由、ARP、监听端口和关键挂载分区。
+- WebUI 拆分为控制台、网络接口、系统信息、关于四个页面，只读展示目标系统状态、全部网络接口、路由、ARP、监听端口和关键挂载分区。
+- 关于页面包含项目仓库、签名、内嵌头像和独立赞助卡片；头像源文件位于 `pic/miku_compressed.jpg`，赞助二维码源文件位于 `pic/sponsor_clean.jpg`，构建时写入二进制并由 `/avatar.jpg`、`/sponsor.jpg` 返回。
 - WebUI 和 HTTP 接口内置目标设备侧网络诊断，可测试 STA 网关、DNS UDP 查询、DNS TCP 连接和指定 IPv4 探测；同时包含 raw packet L2 ICMP fallback，不依赖目标系统 busybox `ping`。
 
 默认 WebUI 监听：
@@ -59,7 +61,7 @@ chmod +x /mnt/userdata/wpa_mini.run
 /mnt/userdata/wpa_mini.run -w -i wlan0-vxd
 ```
 
-`wpa_mini.run` 会自动解压 `wpa_mini` 到 `/tmp/wpa_mini`，设置执行权限，然后把所有参数原样传给 `/tmp/wpa_mini`。
+`wpa_mini.run` 内部是 shell 头加 zip 载荷，会用目标设备的 `sed` 和 `unzip` 解压 `wpa_mini` 到 `/tmp/wpa_mini`，设置执行权限，然后把所有参数原样传给 `/tmp/wpa_mini`。
 
 如果无线接口不是 `wlan0-vxd`，改成实际接口：
 
@@ -106,6 +108,7 @@ chmod +x /mnt/userdata/wpa_mini.run
 | 日志文件 | `/tmp/wpa_mini.log` |
 | driver | `nl80211` |
 | 持久启动包 | `/mnt/userdata/wpa_mini.run` |
+| 持久二进制 | `/mnt/userdata/wpa_mini` |
 | 自启动脚本 | `/mnt/userdata/wpa_mini_autostart.sh` |
 | 系统启动钩子 | `/etc/rc` |
 
@@ -125,13 +128,14 @@ http://<设备IP>:51400/
 
 3. 在 `控制台` 页面点击 `扫描 WiFi` 扫描附近热点。
 4. 输入 SSID 和密码，必要时调整 DNS1/DNS2。BSSID 不需要填写，系统会自动选择具体 AP。
+   `这个 WiFi 在范围内时自动连接` 默认勾选，连接成功后会随保存记录一起保留。
 5. 如需连接成功后立即让热点或 USB 网口设备也能上网，勾选 `连接后共享网络给热点和 USB 设备`。
 6. 点击 `连接`。连接成功后，本设备会自动通过这个 WiFi 访问外网。
 7. 连接成功后，主面板会切换为 `当前连接`，可直接点击 `共享网络给热点和 USB 设备` 或 `关闭共享网络`。
    如果上游网段和热点/USB 网段冲突，开启共享时会自动选择一个未占用本地网段并重启 `udhcpd`。
 8. 连接成功后，该 WiFi 会出现在 `已保存 WiFi` 区域。
-9. 后续可在 `已保存 WiFi` 中点击 `连接` 一键重连，或点击 `删除` 移除记录。
-10. 如需开机后自动启动 WebUI，确认 `/mnt/userdata/wpa_mini.run` 存在并可读，然后点击 `启用自启动`。
+9. 后续可在 `已保存 WiFi` 中点击 `连接` 一键重连，点击 `开启自动连接` / `关闭自动连接` 调整范围内自动连接行为，或点击 `删除` 移除记录。
+10. 如需开机后自动启动 WebUI，点击 `启用自启动`；程序会自动复制当前启动文件到 `/mnt/userdata` 并写入启动项。
 11. 在侧边栏进入 `网络接口` 页面查看原系统接口，例如 `wan1` 到 `wan8`、`br0`、`usblan0`、`wlan0`、`wlan0-vxd`，以及路由和 ARP。
 12. 在侧边栏进入 `系统信息` 页面查看主机状态、监听端口和关键挂载分区。
 13. 需要断开时点击 `断开`；断开会清理 `wpa_mini` 创建的中继 NAT 规则。
@@ -231,6 +235,14 @@ curl -X POST -d 'idx=0' http://127.0.0.1:51400/connect_saved
 curl -X POST \
   -d 'ssid=MyWiFi' \
   http://127.0.0.1:51400/forget
+```
+
+切换已保存 WiFi 的范围内自动连接：
+
+```sh
+curl -X POST \
+  -d 'ssid=MyWiFi&enabled=1' \
+  http://127.0.0.1:51400/autoconnect_saved
 ```
 
 断开连接：
@@ -345,7 +357,7 @@ nameserver 119.29.29.29
 
 ## 已保存 WiFi
 
-WebUI 连接成功后会把 SSID、密码、DNS、隐藏 SSID 和共享网络选项保存到：
+WebUI 连接成功后会把 SSID、密码、DNS、隐藏 SSID、共享网络选项和范围内自动连接选项保存到：
 
 ```sh
 /mnt/userdata/etc_rw/wpa_mini_saved.conf
@@ -392,6 +404,9 @@ PATH=$PWD/cross_toolchain/bin:$PATH make clean strip size
 PATH=$PWD/cross_toolchain/bin:$PATH make run
 ```
 
+生成 `wpa_mini.run` 需要构建机存在 `python3`，用于写入 zip 载荷。
+构建 `wpa_mini` 时也会使用 `python3` 把 `pic/miku_compressed.jpg` 和 `pic/sponsor_clean.jpg` 转成内嵌 C 资源。
+
 诊断版会加入更多 engine wrapper 日志，体积更大：
 
 ```sh
@@ -416,30 +431,28 @@ make distclean
 - 目标设备需要有可用无线接口，例如 `wlan0-vxd`。
 - 目标设备需要存在 `/sbin/udhcpc`。
 - 使用 WiFi 中继/NAT 时，目标设备需要存在 `iptables`，并保留系统原有 `br0`、`dnsmasq`、`udhcpd` 服务。
-- 使用 `wpa_mini.run` 时，目标设备需要存在 `awk`，以及 `zcat`、`gunzip` 或 BusyBox `gunzip`。
+- 使用 `wpa_mini.run` 时，目标设备需要存在 `sed` 和 `unzip`。当前目标设备的 BusyBox `unzip` 可用。
 - 程序通常需要 root 权限或足够的网络控制权限。
 - 设备防火墙需要允许访问 `51400` 端口。
 
 ## 开机自启动
 
-WebUI 的 `启用自启动` 按钮会执行两步：
+WebUI 的 `启用自启动` 按钮会执行三步：
 
+- 定位当前启动文件，并复制到 `/mnt/userdata/wpa_mini.run` 或 `/mnt/userdata/wpa_mini`。
 - 写入 `/mnt/userdata/wpa_mini_autostart.sh`。
 - 尝试在 `/etc/rc` 末尾写入带标记的启动钩子。
 
 启动钩子只会包含 `# wpa_mini autostart begin` 到 `# wpa_mini autostart end` 之间的内容，关闭自启动时也只移除这段标记块。若根分区仍不可写，WebUI 会提示系统启动钩子写入失败；此时持久启动脚本可能已经写入，但真正开机自启动不会生效。
 
-启用前需要先把自解压包放到持久路径：
+如果 WebUI 是从 `.run` 启动的，例如 `/tmp/wpa_mini.run -w`，启用自启动时会复制这个 `.run` 到 `/mnt/userdata/wpa_mini.run`。如果 WebUI 是从普通二进制启动的，则会复制当前二进制到 `/mnt/userdata/wpa_mini` 作为兜底。
 
-```sh
-cp wpa_mini.run /mnt/userdata/wpa_mini.run
-chmod +x /mnt/userdata/wpa_mini.run
-```
-
-开机后自启动脚本会尝试把 `/tmp` remount 为可执行，然后启动：
+开机后自启动脚本会尝试把 `/tmp` remount 为可执行，然后启动持久化后的文件：
 
 ```sh
 /mnt/userdata/wpa_mini.run -w -i wlan0-vxd
+# 或
+/mnt/userdata/wpa_mini -w -i wlan0-vxd
 ```
 
 ## 安全注意
