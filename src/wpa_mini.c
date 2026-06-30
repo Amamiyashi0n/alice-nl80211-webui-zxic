@@ -46,6 +46,7 @@
 #define DEFAULT_DNS_PATH "/mnt/userdata/etc_rw/resolv.conf"
 #define SYSTEM_DNS_PATH "/etc_rw/resolv.conf"
 #define DEFAULT_SAVED_PATH "/mnt/userdata/etc_rw/wpa_mini_saved.conf"
+#define DEFAULT_SETTINGS_PATH "/mnt/userdata/etc_rw/wpa_mini_settings.conf"
 #define DEFAULT_AUTOCONNECT_STATE "/tmp/wpa_mini_autoconnect.state"
 #define DEFAULT_RELAY_STATE "/tmp/wpa_mini_relay.state"
 #define DEFAULT_RELAY_PIDFILE "/tmp/wpa_mini_relay.pid"
@@ -72,6 +73,7 @@
 #define SCAN_HTML_MAX 28000
 #define SAVED_HTML_MAX 12000
 #define AUTOSTART_HTML_MAX 6000
+#define SETTINGS_HTML_MAX 3000
 #define SYSTEM_HTML_MAX 42000
 #define SYSTEM_TEXT_MAX 32768
 #define DIAG_TEXT_MAX 12000
@@ -114,10 +116,13 @@ struct app_config {
 	const char *log_path;
 	const char *udhcpc;
 	int port;
+	char self_path[PATH_MAX];
 };
 
 static char signal_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 static char engine_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
+static volatile sig_atomic_t webui_restart_requested;
+static int webui_restart_port;
 
 struct runtime_status;
 
@@ -1069,6 +1074,56 @@ static int mkdir_parent(const char *path)
 
 	*slash = '\0';
 	return mkdir_p(tmp);
+}
+
+static int load_webui_port(void)
+{
+	FILE *fp;
+	char line[128];
+	int port = DEFAULT_PORT;
+
+	fp = fopen(DEFAULT_SETTINGS_PATH, "r");
+	if (!fp)
+		return port;
+
+	while (fgets(line, sizeof(line), fp)) {
+		char *eq;
+		char *end;
+		long value;
+
+		eq = strchr(line, '=');
+		if (!eq)
+			continue;
+		*eq++ = '\0';
+		if (strcmp(line, "port") != 0)
+			continue;
+		errno = 0;
+		value = strtol(eq, &end, 10);
+		if (!errno && value > 0 && value <= 65535)
+			port = (int)value;
+	}
+	fclose(fp);
+	return port;
+}
+
+static int save_webui_port(int port)
+{
+	FILE *fp;
+
+	if (port <= 0 || port > 65535) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (mkdir_parent(DEFAULT_SETTINGS_PATH) < 0)
+		return -1;
+	fp = fopen(DEFAULT_SETTINGS_PATH, "w");
+	if (!fp)
+		return -1;
+	fprintf(fp, "port=%d\n", port);
+	if (fclose(fp) != 0)
+		return -1;
+	chmod(DEFAULT_SETTINGS_PATH, 0600);
+	return 0;
 }
 
 static int is_hex_psk(const char *s)
@@ -2553,7 +2608,7 @@ static void write_autostart_args(FILE *fp, const struct app_config *cfg)
 {
 	fprintf(fp, " -w -i ");
 	shell_quote(fp, cfg->iface);
-	fprintf(fp, " -L %d -c ", cfg->port);
+	fprintf(fp, " -c ");
 	shell_quote(fp, cfg->conf);
 	fprintf(fp, " -C ");
 	shell_quote(fp, cfg->ctrl_dir);
@@ -6234,6 +6289,65 @@ static void http_redirect(int fd, const struct app_config *cfg,
 		send_all(cfg, fd, header, (size_t)len, "redirect");
 }
 
+static int parse_port_text(const char *text, int *port)
+{
+	char *end;
+	long value;
+
+	if (!text || !*text)
+		return -1;
+	errno = 0;
+	value = strtol(text, &end, 10);
+	if (errno || end == text)
+		return -1;
+	while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+		end++;
+	if (*end || value <= 0 || value > 65535)
+		return -1;
+	*port = (int)value;
+	return 0;
+}
+
+static void request_webui_restart(const struct app_config *cfg, int port)
+{
+	webui_restart_port = port;
+	webui_restart_requested = 1;
+	log_msg(cfg, "webui restart requested port=%d", port);
+}
+
+static void restart_webui_process(const struct app_config *cfg, int port)
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0) {
+		log_msg(cfg, "webui restart fork failed errno=%d", errno);
+		return;
+	}
+	if (pid == 0) {
+		char port_arg[16];
+		const char *self = cfg->self_path[0] ? cfg->self_path :
+				   DEFAULT_BIN_PATH;
+
+		snprintf(port_arg, sizeof(port_arg), "%d", port);
+		usleep(200000);
+		execl(self, self,
+		      "-w",
+		      "-i", cfg->iface,
+		      "-L", port_arg,
+		      "-c", cfg->conf,
+		      "-C", cfg->ctrl_dir,
+		      "-D", cfg->driver,
+		      "-P", cfg->pidfile,
+		      "-r", cfg->dns_path,
+		      "-l", cfg->log_path,
+		      "-u", cfg->udhcpc,
+		      (char *)NULL);
+		_exit(127);
+	}
+	log_msg(cfg, "webui restart child pid=%ld port=%d", (long)pid, port);
+}
+
 static void build_scan_html(const char *scan_text, char *out, size_t outsz)
 {
 	char *copy;
@@ -6394,6 +6508,26 @@ static void build_autostart_html(char *out, size_t outsz)
 		   label, detail, payload,
 		   st.script_ready ? "已写入" : "未写入",
 		   st.hook_ready ? "已安装" : "未安装");
+}
+
+static void build_settings_html(const struct app_config *cfg,
+				char *out, size_t outsz)
+{
+	if (outsz)
+		out[0] = '\0';
+
+	buf_append(out, outsz,
+		   "<section class=\"panel\"><div class=\"formtop\"><div>"
+		   "<div class=\"title\">WebUI 设置</div>"
+		   "<div class=\"hint\">端口默认保存到 " DEFAULT_SETTINGS_PATH "</div>"
+		   "</div></div><div class=\"pad\">"
+		   "<form method=\"post\" action=\"/set_port\">"
+		   "<label>WebUI 端口</label>"
+		   "<input name=\"port\" value=\"%d\" inputmode=\"numeric\" pattern=\"[0-9]*\" required>"
+		   "<div class=\"actions\"><button type=\"submit\">保存并切换端口</button></div>"
+		   "</form><div class=\"hint\">修改后 WebUI 会立即切换到新端口。</div>"
+		   "</div></section>",
+		   cfg->port);
 }
 
 static void append_system_overview_html(const struct system_snapshot *snap,
@@ -6782,7 +6916,8 @@ static void append_home_content(char *body, size_t bodysz,
 				const struct runtime_status *st,
 				const char *scan_html,
 				const char *saved_html,
-				const char *autostart_html)
+				const char *autostart_html,
+				const char *settings_html)
 {
 	char esc_ssid[256], esc_iface[128], esc_state[128], esc_bssid[128];
 	char esc_ip[128], esc_gw[128], esc_dns[256], esc_dns_path[512];
@@ -6897,7 +7032,7 @@ static void append_home_content(char *body, size_t bodysz,
 		   "<div class=\"kv\"><div class=\"k\">热点/USB 接口</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">上游出口</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">ip_forward / NAT / DHCP / 用户态转发</div><div class=\"v\">%d / %s / %s / %s</div></div>"
-		   "</div></div></section></div>%s%s%s",
+		   "</div></div></section></div>%s%s%s%s",
 		   esc_bssid[0] ? esc_bssid : "-",
 		   esc_gw[0] ? esc_gw : "-",
 		   esc_dns[0] ? esc_dns : "-",
@@ -6911,7 +7046,7 @@ static void append_home_content(char *body, size_t bodysz,
 		   st->relay_nat_rule ? "存在" : "无",
 		   st->relay_dhcp_running ? "运行" : "停止",
 		   st->relay_user_nat_running ? "运行" : "停止",
-		   autostart_html, saved_html, scan_html);
+		   settings_html, autostart_html, saved_html, scan_html);
 }
 
 static void render_page(int fd, const struct app_config *cfg,
@@ -6921,6 +7056,7 @@ static void render_page(int fd, const struct app_config *cfg,
 	char *scan_html;
 	char *saved_html;
 	char *autostart_html;
+	char *settings_html;
 	char *body;
 	char auto_msg[256];
 	const char *display_message = message;
@@ -6930,11 +7066,14 @@ static void render_page(int fd, const struct app_config *cfg,
 	scan_html = calloc(1, SCAN_HTML_MAX);
 	saved_html = calloc(1, SAVED_HTML_MAX);
 	autostart_html = calloc(1, AUTOSTART_HTML_MAX);
+	settings_html = calloc(1, SETTINGS_HTML_MAX);
 	body = calloc(1, PAGE_BODY_MAX);
-	if (!scan_html || !saved_html || !autostart_html || !body) {
+	if (!scan_html || !saved_html || !autostart_html ||
+	    !settings_html || !body) {
 		free(scan_html);
 		free(saved_html);
 		free(autostart_html);
+		free(settings_html);
 		free(body);
 		log_msg(cfg, "render home allocation failed");
 		http_send(fd, cfg, 500, "Internal Server Error", "text/plain",
@@ -6952,17 +7091,19 @@ static void render_page(int fd, const struct app_config *cfg,
 	build_scan_html(scan_text, scan_html, SCAN_HTML_MAX);
 	build_saved_html(saved_html, SAVED_HTML_MAX);
 	build_autostart_html(autostart_html, AUTOSTART_HTML_MAX);
+	build_settings_html(cfg, settings_html, SETTINGS_HTML_MAX);
 	append_page_start(body, PAGE_BODY_MAX, cfg, &st, WEB_PAGE_HOME,
 			  "控制台", "连接 WiFi、扫描网络、管理已保存配置",
 			  display_message);
 	append_home_content(body, PAGE_BODY_MAX, cfg, &st, scan_html,
-			    saved_html, autostart_html);
+			    saved_html, autostart_html, settings_html);
 	append_page_end(body, PAGE_BODY_MAX);
 
 	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", body);
 	free(scan_html);
 	free(saved_html);
 	free(autostart_html);
+	free(settings_html);
 	free(body);
 }
 
@@ -7567,6 +7708,47 @@ static void handle_relay_off(int fd, const struct app_config *cfg)
 	render_page(fd, cfg, "已关闭共享网络。", NULL);
 }
 
+static void handle_set_port(int fd, const struct app_config *cfg,
+			    const char *body)
+{
+	char value[32];
+	char response[1024];
+	int port;
+
+	form_value(body, "port", value, sizeof(value));
+	if (parse_port_text(value, &port) < 0) {
+		render_page(fd, cfg, "端口无效，请输入 1-65535。", NULL);
+		return;
+	}
+	if (save_webui_port(port) < 0) {
+		log_msg(cfg, "webui port save failed port=%d errno=%d",
+			port, errno);
+		render_page(fd, cfg,
+			    "端口保存失败，请检查 /mnt/userdata 是否可写。",
+			    NULL);
+		return;
+	}
+	if (port == cfg->port) {
+		render_page(fd, cfg, "WebUI 端口已保存。", NULL);
+		return;
+	}
+
+	snprintf(response, sizeof(response),
+		 "<!doctype html><html><head><meta charset=\"utf-8\">"
+		 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+		 "<title>WebUI 端口已切换</title>"
+		 "<style>body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f4f8f2;color:#18251d}"
+		 ".box{max-width:560px;margin:12vh auto;padding:22px;background:#fff;border:1px solid #d9e5dc;border-radius:8px;box-shadow:0 8px 24px rgba(24,37,29,.06)}"
+		 ".h{font-size:22px;font-weight:800}.p{color:#55685c;line-height:1.7}.a{display:inline-block;margin-top:10px;color:#1f6d42;font-weight:800}</style>"
+		 "</head><body><div class=\"box\"><div class=\"h\">WebUI 端口已保存</div>"
+		 "<div class=\"p\">服务正在切换到 %d 端口。请打开新地址继续访问。</div>"
+		 "<a class=\"a\" href=\"http://127.0.0.1:%d/\">http://127.0.0.1:%d/</a>"
+		 "</div></body></html>",
+		 port, port, port);
+	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", response);
+	request_webui_restart(cfg, port);
+}
+
 static void handle_client(int fd, const struct app_config *cfg)
 {
 	char *req;
@@ -7714,6 +7896,9 @@ static void handle_client(int fd, const struct app_config *cfg)
 		   strcmp(path, "/autostart_off") == 0) {
 		handle_autostart_off(fd, cfg);
 	} else if (strcmp(method, "POST") == 0 &&
+		   strcmp(path, "/set_port") == 0) {
+		handle_set_port(fd, cfg, body);
+	} else if (strcmp(method, "POST") == 0 &&
 		   strcmp(path, "/relay_on") == 0) {
 		handle_relay_on(fd, cfg);
 	} else if (strcmp(method, "POST") == 0 &&
@@ -7794,9 +7979,17 @@ static int run_webui(const struct app_config *cfg)
 		log_msg(cfg, "accept closed fd=%d", c);
 		while (waitpid(-1, NULL, WNOHANG) > 0)
 			;
+		if (webui_restart_requested)
+			break;
 	}
 
 	close(s);
+	if (webui_restart_requested) {
+		log_msg(cfg, "webui restart now old_port=%d new_port=%d",
+			cfg->port, webui_restart_port);
+		restart_webui_process(cfg, webui_restart_port);
+		_exit(0);
+	}
 	return 1;
 }
 
@@ -7823,7 +8016,11 @@ int main(int argc, char **argv)
 	cfg.dns_path = DEFAULT_DNS_PATH;
 	cfg.log_path = DEFAULT_LOG_PATH;
 	cfg.udhcpc = DEFAULT_UDHCPC;
-	cfg.port = DEFAULT_PORT;
+	cfg.port = load_webui_port();
+	cfg.self_path[0] = '\0';
+	if (current_exe_path(cfg.self_path, sizeof(cfg.self_path)) < 0)
+		snprintf(cfg.self_path, sizeof(cfg.self_path), "%s",
+			 argv[0] ? argv[0] : DEFAULT_BIN_PATH);
 
 	while ((opt = getopt(argc, argv, "wi:s:p:c:C:D:P:L:r:l:u:HMNFnh")) != -1) {
 		switch (opt) {
