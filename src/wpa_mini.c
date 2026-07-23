@@ -92,8 +92,6 @@ void dynamic_runtime_init(void);
 #define RELAY_IFACES_TEXT_MAX 128
 #define HARDWARE_REASON_MAX 192
 #define DIAG_TIMEOUT_MS 1800
-#define USER_NAT_MAX 128
-#define USER_NAT_TTL_MS 180000
 #define ANDROID_AID_INET 3003
 #define ANDROID_AID_NET_RAW 3004
 #define ANDROID_AID_NET_ADMIN 3005
@@ -150,10 +148,7 @@ static void get_runtime_status(const struct app_config *cfg,
 			       struct runtime_status *st);
 static void read_dns_pair(const char *path, char *dns1, size_t dns1sz,
 			  char *dns2, size_t dns2sz);
-static int start_user_nat(const struct app_config *cfg, const char *lan_if,
-			  const char *wan_if);
 static void stop_user_nat(const struct app_config *cfg);
-static int user_nat_running(void);
 
 typedef void (*wpa_msg_cb_func)(void *ctx, int level, int global,
 				const char *txt, size_t len);
@@ -4117,22 +4112,8 @@ static int start_relay(const struct app_config *cfg, const char *dns1,
 		delete_relay_rule("FORWARD", "", cfg->iface, lan_if, 0);
 		delete_bridge_member_forward_rules(lan_if, subnet, cfg->iface);
 	}
-	if (start_user_nat(cfg, lan_if, cfg->iface) < 0) {
-		log_msg(cfg, "relay user nat start failed errno=%d", errno);
-		if (nat_ok)
-			delete_relay_rule("POSTROUTING", subnet, lan_if,
-					  cfg->iface, 1);
-		if (fwd_ok) {
-			delete_relay_rule("FORWARD", subnet, lan_if,
-					  cfg->iface, 0);
-			delete_relay_rule("FORWARD", "", cfg->iface,
-					  lan_if, 0);
-			delete_bridge_member_forward_rules(lan_if, subnet,
-							   cfg->iface);
-		}
-		write_int_file("/proc/sys/net/ipv4/ip_forward", old_forward);
-		return -1;
-	}
+	log_msg(cfg, "relay kernel nat only lan=%s wan=%s fwd=%d",
+		lan_if, cfg->iface, fwd_ok);
 
 	relay_write_state(lan_if, subnet, cfg->iface, old_forward, nat_ok,
 			  fwd_ok);
@@ -4200,7 +4181,8 @@ static void get_relay_status(const struct app_config *cfg,
 
 	st->relay_ip_forward =
 		read_int_file("/proc/sys/net/ipv4/ip_forward", 0);
-	st->relay_user_nat_running = user_nat_running();
+	/* Kernel forwarding is authoritative; legacy raw NAT is never started. */
+	st->relay_user_nat_running = 0;
 	if (relay_read_state(lan_if, sizeof(lan_if), subnet, sizeof(subnet),
 			     wan_if, sizeof(wan_if), &old_forward, &nat_rule,
 			     &fwd_rule) < 0)
@@ -4221,7 +4203,6 @@ static void get_relay_status(const struct app_config *cfg,
 			    st->ip[0] &&
 			    st->relay_ip_forward == 1 && st->relay_nat_rule &&
 			    st->relay_dhcp_running &&
-			    st->relay_user_nat_running &&
 			    !st->sta_lan_conflict && st->default_route_ready;
 	(void)cfg;
 	(void)old_forward;
@@ -4367,11 +4348,6 @@ static void put16(unsigned char *p, unsigned short v)
 {
 	p[0] = (unsigned char)(v >> 8);
 	p[1] = (unsigned char)(v & 0xff);
-}
-
-static unsigned short get16(const unsigned char *p)
-{
-	return (unsigned short)((p[0] << 8) | p[1]);
 }
 
 static int read_arp_mac(const char *ip, const char *iface,
@@ -4634,6 +4610,8 @@ static int diag_l2_icmp_ping_ip(const char *dst_ip, const char *src_ip,
 	return -1;
 }
 
+#if 0
+/* Removed raw packet NAT implementation; kernel NAT is the only relay path. */
 struct user_nat_entry {
 	int used;
 	unsigned char proto;
@@ -5159,6 +5137,14 @@ static int start_user_nat(const struct app_config *cfg, const char *lan_if,
 	}
 	log_msg(cfg, "user nat child pid=%ld", (long)pid);
 	return 0;
+}
+
+#endif
+
+static void stop_user_nat(const struct app_config *cfg)
+{
+	log_msg(cfg, "legacy user nat cleanup requested");
+	stop_pidfile_process(DEFAULT_RELAY_PIDFILE);
 }
 
 static int diag_tcp_connect_ip(const char *dst_ip, int port,
@@ -7471,7 +7457,7 @@ static void append_home_content(char *body, size_t bodysz,
 		   "<div class=\"kv\"><div class=\"k\">下层网络</div><div class=\"v\">%s %s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">热点/USB 接口</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">上游出口</div><div class=\"v\">%s</div></div>"
-		   "<div class=\"kv\"><div class=\"k\">ip_forward / NAT / DHCP / 用户态转发</div><div class=\"v\">%d / %s / %s / %s</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">ip_forward / 内核 NAT / DHCP</div><div class=\"v\">%d / %s / %s</div></div>"
 		   "</div></div></section></div>%s%s%s%s",
 		   esc_bssid[0] ? esc_bssid : "-",
 		   esc_gw[0] ? esc_gw : "-",
@@ -7487,7 +7473,6 @@ static void append_home_content(char *body, size_t bodysz,
 		   st->relay_ip_forward,
 		   st->relay_nat_rule ? "存在" : "无",
 		   st->relay_dhcp_running ? "运行" : "停止",
-		   st->relay_user_nat_running ? "运行" : "停止",
 		   settings_html, autostart_html, saved_html, scan_html);
 }
 
@@ -7731,7 +7716,7 @@ static void render_status(int fd, const struct app_config *cfg)
 		 st.relay_ip_forward,
 		 st.relay_nat_rule ? "true" : "false",
 		 st.relay_dhcp_running ? "true" : "false",
-		 st.relay_user_nat_running ? "true" : "false",
+		 "false",
 		 cfg->port);
 	http_send(fd, cfg, 200, "OK", "application/json", body);
 }
