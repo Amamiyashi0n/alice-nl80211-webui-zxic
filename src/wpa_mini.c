@@ -59,6 +59,9 @@ void dynamic_runtime_init(void);
 #define DEFAULT_BIN_PATH "/mnt/userdata/wpa_mini"
 #define DEFAULT_AUTOSTART_SCRIPT "/mnt/userdata/wpa_mini_autostart.sh"
 #define DEFAULT_AUTOSTART_RC "/etc/rc"
+#define DEFAULT_ADMIN_HOSTNAME "zxic-admin-webui"
+#define DEFAULT_ADMIN_HOSTS "/mnt/userdata/etc_rw/zxic-admin-webui.hosts"
+#define DEFAULT_DNSMASQ_PATH "/bin/dnsmasq"
 #define AUTOSTART_BEGIN "# wpa_mini autostart begin"
 #define AUTOSTART_END "# wpa_mini autostart end"
 #define DEFAULT_DNS1 "223.5.5.5"
@@ -130,11 +133,14 @@ static int hardware_probe_done;
 static int hardware_probe_supported = -1;
 static char hardware_probe_iface[IFNAMSIZ];
 static char hardware_probe_reason[HARDWARE_REASON_MAX];
+static pid_t webui_dnsmasq_pid;
+static char webui_dnsmasq_ip[INET_ADDRSTRLEN];
 
 struct runtime_status;
 
 static int mkdir_parent(const char *path);
 static void signal_dnsmasq_reload(const struct app_config *cfg);
+static void sync_webui_hostname(const struct app_config *cfg);
 static void stop_relay(const struct app_config *cfg);
 static void set_cloexec(int fd);
 static void close_inherited_fds(void);
@@ -192,6 +198,8 @@ struct runtime_status {
 	char dns[192];
 	char sta_subnet[64];
 	char lan_subnet[64];
+	char lan_suggested_subnet[64];
+	char lan_management_ip[INET_ADDRSTRLEN];
 	int default_route_ready;
 	int sta_lan_conflict;
 	int relay_enabled;
@@ -3168,6 +3176,33 @@ static int iface_subnet_cidr(const char *iface, char *out, size_t outsz)
 	return 0;
 }
 
+static int management_ip_from_cidr(const char *cidr, char *out, size_t outsz)
+{
+	char addr[INET_ADDRSTRLEN];
+	struct in_addr ip;
+	const char *slash;
+	size_t len;
+	uint32_t host;
+
+	if (!cidr || !*cidr || !out || !outsz)
+		return -1;
+	slash = strchr(cidr, '/');
+	len = slash ? (size_t)(slash - cidr) : strlen(cidr);
+	if (!len || len >= sizeof(addr))
+		return -1;
+	memcpy(addr, cidr, len);
+	addr[len] = '\0';
+	if (inet_pton(AF_INET, addr, &ip) != 1)
+		return -1;
+	host = ntohl(ip.s_addr);
+	if ((host & 0xffU) != 0 || host == 0xffffffffU)
+		return -1;
+	ip.s_addr = htonl(host + 1);
+	if (!inet_ntop(AF_INET, &ip, out, outsz))
+		return -1;
+	return 0;
+}
+
 static int ifaces_same_subnet(const char *a, const char *b)
 {
 	struct in_addr ip_a;
@@ -3294,6 +3329,42 @@ static void ipv4_from_host(uint32_t host, char *out, size_t outsz)
 
 	a.s_addr = htonl(host);
 	inet_ntop(AF_INET, &a, out, outsz);
+}
+
+static void format_original_admin_url(char *out, size_t outsz)
+{
+	if (!out || !outsz)
+		return;
+	snprintf(out, outsz, "http://%s/", DEFAULT_ADMIN_HOSTNAME);
+}
+
+static void format_lan_conflict_message(char *out, size_t outsz,
+					const char *sta_subnet,
+					const char *lan_subnet,
+					const char *suggested_subnet,
+					const char *management_ip,
+					int adjusted)
+{
+	const char *sta = sta_subnet && *sta_subnet ? sta_subnet : "未知";
+	const char *lan = lan_subnet && *lan_subnet ? lan_subnet : "未知";
+
+	if (!suggested_subnet || !*suggested_subnet ||
+	    !management_ip || !*management_ip) {
+		snprintf(out, outsz,
+			 "检测到网段冲突：上游网段 %.63s 与本地管理网段 %.63s 重叠，当前没有找到可用的本地网段。",
+			 sta, lan);
+		return;
+	}
+	if (adjusted) {
+		snprintf(out, outsz,
+			 "检测到网段冲突：上游网段 %.63s 与本地管理网段 %.63s 重叠。已切换本地管理网段至 %.63s，原版后台可通过 http://%s/ 访问（当前地址 http://%.15s/）。",
+			 sta, lan, suggested_subnet, DEFAULT_ADMIN_HOSTNAME,
+			 management_ip);
+		return;
+	}
+	snprintf(out, outsz,
+		 "检测到网段冲突：上游网段 %.63s 与本地管理网段 %.63s 重叠。继续使用将切换本地管理网段至 %.63s，原版后台可通过 http://%s/ 访问（切换后地址 http://%.15s/）。",
+		 sta, lan, suggested_subnet, DEFAULT_ADMIN_HOSTNAME, management_ip);
 }
 
 static int write_udhcpd_conf(uint32_t net_host, const char *dns1,
@@ -3536,12 +3607,14 @@ static int adjust_lan_subnet(const struct app_config *cfg, uint32_t net_host,
 			     const char *dns1, const char *dns2,
 			     char *new_subnet, size_t new_subnet_sz)
 {
+	char ip_network[INET_ADDRSTRLEN];
 	char ip_router[INET_ADDRSTRLEN];
 	char ip_bcast[INET_ADDRSTRLEN];
 	char *ifconfig_args[] = { "br0", ip_router, "netmask", "255.255.255.0",
 				  "broadcast", ip_bcast, "up", NULL };
 	FILE *fp;
 
+	ipv4_from_host(net_host, ip_network, sizeof(ip_network));
 	ipv4_from_host(net_host + 1, ip_router, sizeof(ip_router));
 	ipv4_from_host(net_host + 255, ip_bcast, sizeof(ip_bcast));
 	log_msg(cfg, "lan adjust requested br0=%s/24", ip_router);
@@ -3566,7 +3639,7 @@ static int adjust_lan_subnet(const struct app_config *cfg, uint32_t net_host,
 		fprintf(fp, "br0=%s\nnet=%u\n", ip_router, net_host);
 		fclose(fp);
 	}
-	snprintf(new_subnet, new_subnet_sz, "%s/24", ip_router);
+	snprintf(new_subnet, new_subnet_sz, "%s/24", ip_network);
 	return 0;
 }
 
@@ -3704,6 +3777,175 @@ static void signal_dnsmasq_reload(const struct app_config *cfg)
 		}
 	}
 	pclose(fp);
+}
+
+static pid_t find_dnsmasq_pid(void)
+{
+	FILE *fp;
+	char line[512];
+
+	fp = popen("ps 2>/dev/null", "r");
+	if (!fp)
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		long pid;
+		char *end;
+
+		if (!strstr(line, "dnsmasq"))
+			continue;
+		errno = 0;
+		pid = strtol(line, &end, 10);
+		if (pid > 1 && !errno && (pid_t)pid != getpid()) {
+			pclose(fp);
+			return (pid_t)pid;
+		}
+	}
+	pclose(fp);
+	return 0;
+}
+
+static void stop_dnsmasq_process(pid_t pid)
+{
+	int i;
+
+	if (pid <= 1 || pid == getpid())
+		return;
+	kill(pid, SIGTERM);
+	for (i = 0; i < 10; i++) {
+		if (!process_running(pid))
+			return;
+		usleep(100000);
+	}
+	if (process_running(pid))
+		kill(pid, SIGKILL);
+}
+
+static int write_webui_hosts(const char *ip)
+{
+	char tmp[PATH_MAX];
+	FILE *fp;
+	int n;
+
+	if (!ip || !*ip)
+		return -1;
+	if (mkdir_parent(DEFAULT_ADMIN_HOSTS) < 0)
+		return -1;
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp", DEFAULT_ADMIN_HOSTS);
+	if (n < 0 || (size_t)n >= sizeof(tmp)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	fp = fopen(tmp, "w");
+	if (!fp)
+		return -1;
+	if (fprintf(fp, "%s %s %s.lan\n", ip, DEFAULT_ADMIN_HOSTNAME,
+		    DEFAULT_ADMIN_HOSTNAME) < 0) {
+		fclose(fp);
+		unlink(tmp);
+		return -1;
+	}
+	if (fclose(fp) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	if (chmod(tmp, 0644) < 0 || rename(tmp, DEFAULT_ADMIN_HOSTS) < 0) {
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
+}
+
+static pid_t start_webui_dnsmasq(int with_alias)
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0)
+		return 0;
+	if (pid == 0) {
+		int fd;
+
+		setsid();
+		fd = open("/tmp/wpa_mini_dnsmasq.log",
+			   O_WRONLY | O_CREAT | O_APPEND, 0600);
+		if (fd < 0)
+			fd = open("/dev/null", O_RDWR);
+		if (fd >= 0) {
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			if (fd > STDERR_FILENO)
+				close(fd);
+		}
+		fd = open("/dev/null", O_RDONLY);
+		if (fd >= 0) {
+			dup2(fd, STDIN_FILENO);
+			if (fd > STDERR_FILENO)
+				close(fd);
+		}
+		close_inherited_fds();
+		if (with_alias)
+			execl(DEFAULT_DNSMASQ_PATH, "dnsmasq", "-i", "br0",
+			      "-r", SYSTEM_DNS_PATH, "-H", DEFAULT_ADMIN_HOSTS,
+			      "-z", "-k", (char *)NULL);
+		else
+			execl(DEFAULT_DNSMASQ_PATH, "dnsmasq", "-i", "br0",
+			      "-r", SYSTEM_DNS_PATH, "-z", "-k", (char *)NULL);
+		_exit(127);
+	}
+	usleep(150000);
+	if (!process_running(pid)) {
+		waitpid(pid, NULL, WNOHANG);
+		return 0;
+	}
+	return pid;
+}
+
+static void sync_webui_hostname(const struct app_config *cfg)
+{
+	char ip[INET_ADDRSTRLEN];
+	pid_t pid;
+
+	if (read_iface_ipv4("br0", ip, sizeof(ip)) < 0 || !ip[0])
+		return;
+	if (webui_dnsmasq_pid > 0 && process_running(webui_dnsmasq_pid) &&
+	    strcmp(webui_dnsmasq_ip, ip) == 0)
+		return;
+	if (access(DEFAULT_DNSMASQ_PATH, X_OK) < 0) {
+		log_msg(cfg, "webui hostname unavailable: dnsmasq missing errno=%d",
+			errno);
+		return;
+	}
+	if (write_webui_hosts(ip) < 0) {
+		log_msg(cfg, "webui hostname hosts write failed ip=%s errno=%d",
+			ip, errno);
+		return;
+	}
+	if (webui_dnsmasq_pid > 0 &&
+	    process_running(webui_dnsmasq_pid)) {
+		if (kill(webui_dnsmasq_pid, SIGHUP) == 0) {
+			snprintf(webui_dnsmasq_ip, sizeof(webui_dnsmasq_ip), "%s", ip);
+			log_msg(cfg, "original admin hostname updated ip=%s pid=%ld",
+				ip, (long)webui_dnsmasq_pid);
+			return;
+		}
+	}
+	pid = find_dnsmasq_pid();
+	if (pid > 1)
+		stop_dnsmasq_process(pid);
+	webui_dnsmasq_pid = start_webui_dnsmasq(1);
+	if (webui_dnsmasq_pid > 0) {
+		snprintf(webui_dnsmasq_ip, sizeof(webui_dnsmasq_ip), "%s", ip);
+		log_msg(cfg, "original admin hostname enabled name=%s ip=%s pid=%ld",
+			DEFAULT_ADMIN_HOSTNAME, ip, (long)webui_dnsmasq_pid);
+		return;
+	}
+	log_msg(cfg, "original admin hostname dnsmasq alias start failed errno=%d",
+		errno);
+	webui_dnsmasq_pid = start_webui_dnsmasq(0);
+	webui_dnsmasq_ip[0] = '\0';
+	if (webui_dnsmasq_pid > 0)
+		log_msg(cfg, "original admin hostname fallback dnsmasq restored pid=%ld",
+			(long)webui_dnsmasq_pid);
 }
 
 static void sync_system_dns_for_relay(const struct app_config *cfg,
@@ -5913,7 +6155,20 @@ static void get_runtime_status(const struct app_config *cfg,
 		st->lan_subnet[0] = '\0';
 	st->default_route_ready = iface_has_default_route(cfg->iface);
 	st->sta_lan_conflict = ifaces_same_subnet(cfg->iface, "br0");
+	if (st->sta_lan_conflict) {
+		uint32_t net_host;
+		char network[INET_ADDRSTRLEN];
+
+		if (choose_lan_subnet(&net_host) == 0) {
+			ipv4_from_host(net_host, network, sizeof(network));
+			snprintf(st->lan_suggested_subnet,
+				 sizeof(st->lan_suggested_subnet), "%s/24", network);
+			ipv4_from_host(net_host + 1, st->lan_management_ip,
+				       sizeof(st->lan_management_ip));
+		}
+	}
 	get_relay_status(cfg, st);
+	sync_webui_hostname(cfg);
 }
 
 static int runtime_is_connected(const struct runtime_status *st)
@@ -6963,6 +7218,9 @@ static void append_page_start(char *body, size_t bodysz,
 	char esc_title[128], esc_subtitle[256], esc_msg[512];
 	char esc_iface[128], esc_state[128], esc_ssid[256], esc_ip[128];
 	char esc_hardware[768];
+	char esc_sta_subnet[128], esc_lan_subnet[128];
+	char esc_suggested_subnet[128], esc_management_ip[128];
+	char admin_url[128], esc_admin_url[160];
 	const char *state_color;
 	const char *state_label;
 
@@ -6974,6 +7232,14 @@ static void append_page_start(char *body, size_t bodysz,
 	html_escape(esc_ssid, sizeof(esc_ssid), st->ssid);
 	html_escape(esc_ip, sizeof(esc_ip), st->ip);
 	html_escape(esc_hardware, sizeof(esc_hardware), st->hardware_reason);
+	html_escape(esc_sta_subnet, sizeof(esc_sta_subnet), st->sta_subnet);
+	html_escape(esc_lan_subnet, sizeof(esc_lan_subnet), st->lan_subnet);
+	html_escape(esc_suggested_subnet, sizeof(esc_suggested_subnet),
+		    st->lan_suggested_subnet);
+	html_escape(esc_management_ip, sizeof(esc_management_ip),
+		    st->lan_management_ip);
+	format_original_admin_url(admin_url, sizeof(admin_url));
+	html_escape(esc_admin_url, sizeof(esc_admin_url), admin_url);
 	if (st->hardware_supported == 0) {
 		state_color = "#b3261e";
 		state_label = "硬件不支持";
@@ -7000,13 +7266,14 @@ static void append_page_start(char *body, size_t bodysz,
 		   ".nav{display:flex;flex-direction:column;gap:6px}.nav a{border-radius:8px;padding:10px 11px;color:#405246;font-size:14px;font-weight:700;transition:background .15s,color .15s,transform .15s}.nav a:hover{background:#eef7ef;transform:translateX(2px)}.nav a.active{background:#dcefe2;color:#1e5e3a}"
 		   ".sidecard{margin-top:auto;border:1px solid #dbe8dc;border-radius:8px;background:#fff;padding:12px}.pill{display:inline-block;border-radius:999px;padding:6px 10px;background:%s;color:#fff;font-size:13px;font-weight:800;white-space:nowrap}"
 		   "main.page{min-width:0;max-width:1160px;width:100%%;margin:0 auto;padding:22px 22px 30px}.topline{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:16px}.h1{font-size:25px;font-weight:800;letter-spacing:0}.topmeta{text-align:right;min-width:128px}"
-		   ".msg{background:#eef8f0;border:1px solid #c9dfd0;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.hardware-error{background:#fff1f1;border:1px solid #e0a7a7;border-radius:8px;color:#a32626;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.hardware-error strong{display:block;margin-bottom:4px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.9fr);gap:14px}"
+		   ".admin-url{display:block;margin-top:4px;color:#1f6d42;font-size:12px;font-weight:800;word-break:break-all}"
+		   ".msg{background:#eef8f0;border:1px solid #c9dfd0;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.hardware-error{background:#fff1f1;border:1px solid #e0a7a7;border-radius:8px;color:#a32626;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.hardware-error strong{display:block;margin-bottom:4px}.network-warning{background:#fff8e6;border:1px solid #e6c77a;border-radius:8px;color:#765400;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.network-warning strong{display:block;margin-bottom:4px}.network-warning code{font-family:monospace;font-weight:800}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.9fr);gap:14px}"
 		   ".panel{background:#fff;border:1px solid #d9e5dc;border-radius:8px;margin-bottom:14px;box-shadow:0 5px 16px rgba(24,37,29,.045);overflow:hidden;animation:rise .22s ease-out}.panel.hot{animation:pulse .7s ease-out}.formtop{border-bottom:1px solid #e7eee8;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px}.title{font-size:16px;font-weight:800}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.wide{grid-column:1/-1}"
 		   ".kv{border-bottom:1px solid #edf2ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e5dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:800;word-break:break-all;margin-top:3px}.smallv{font-size:12px;font-weight:700;line-height:1.45}"
 		   ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:800;margin:11px 0 5px}"
 		   "input{width:100%%;height:40px;border:1px solid #b8c7bb;border-radius:6px;padding:9px 10px;font-size:14px;background:#fff;outline:none;transition:border-color .15s,box-shadow .15s}"
 		   "input:focus{border-color:#2f7d4f;box-shadow:0 0 0 3px #dfeee5}.check{display:flex;gap:7px;align-items:center;margin:12px 0}.check input{width:auto;height:auto}.check label{margin:0;font-weight:700}"
-		   ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}button.alt,button.scan{background:#fff;color:#2f7d4f}"
+		   ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}button{height:40px;border:1px solid #2f7d4f;border-radius:6px;background:#2f7d4f;color:#fff;font-size:14px;font-weight:800;padding:0 17px;cursor:pointer;transition:background .15s,transform .15s,opacity .15s}button:hover{transform:translateY(-1px);background:#256f43}button.busy{opacity:.72;pointer-events:none}button.alt,button.scan{background:#fff;color:#2f7d4f}button.warn{background:#c18a16;border-color:#a87308;color:#fff}button.warn:hover{background:#a87308}"
 		   ".tablewrap{overflow:auto}.saved{border:1px solid #edf2ee;border-radius:8px;padding:10px;margin-bottom:9px;display:flex;justify-content:space-between;gap:10px;align-items:center}.savedact{display:flex;gap:8px;flex-wrap:wrap}.savedact form{margin:0}.pick{height:32px;padding:0 12px}.ssidcell{font-weight:800;color:#1d3b29}.tag{display:inline-block;margin-left:5px;border-radius:5px;background:#e4f1e8;color:#286542;padding:2px 5px;font-size:11px}.focusrow{background:#f0f8f2}.defrow{background:#f8fbf3}.tinylink{font-size:12px;font-weight:800;color:#2f7d4f;border:1px solid #d1e5d7;border-radius:999px;padding:6px 9px;background:#fbfffc}"
 		   ".about{display:grid;grid-template-columns:148px minmax(0,1fr);gap:18px;align-items:center}.avatar{width:132px;height:132px;border-radius:8px;object-fit:cover;border:1px solid #d9e5dc;box-shadow:0 8px 22px rgba(24,37,29,.08)}.aboutname{font-size:20px;font-weight:800;margin-bottom:7px}.signature{margin-top:13px;color:#2f5f40;font-size:15px;font-weight:800;line-height:1.7}.repo{display:inline-block;margin-top:13px;color:#1f6d42;font-weight:800;word-break:break-all}.labelrow{margin-top:13px;color:#5f7166;font-size:13px;font-weight:800}.labelrow .repo{margin-top:0}.supporthead{display:block}.supportdesc{color:#405246;font-size:14px;font-weight:700;line-height:1.75;margin-top:7px}.supportgrid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:14px;align-items:stretch}.supportcard{border:1px solid #e0eadf;border-radius:8px;background:#fbfdf9;padding:14px;min-width:0}.supporttitle{font-size:15px;font-weight:800;margin-bottom:7px}.plainlink{display:inline-block;color:#1f6d42;font-weight:800;word-break:break-all}.qrbox{display:flex;justify-content:center;align-items:center}.qr{display:block;width:100%%;max-width:190px;height:auto;border-radius:8px;border:1px solid #e5dff0;background:#fff;box-shadow:0 8px 18px rgba(24,37,29,.06)}"
 		   "table{width:100%%;border-collapse:collapse;font-size:13px;min-width:680px}th,td{text-align:left;border-bottom:1px solid #e7eee8;padding:9px;vertical-align:top}th{color:#596960;background:#f8faf7;font-weight:800}"
@@ -7015,14 +7282,14 @@ static void append_page_start(char *body, size_t bodysz,
 		   "<div class=\"brandbox\"><div class=\"brand\">WPA Mini</div><div class=\"sub\">WiFi STA 控制台</div></div>"
 		   "<nav class=\"nav\"><a class=\"%s\" href=\"/\">控制台</a><a class=\"%s\" href=\"/interfaces\">网络接口</a><a class=\"%s\" href=\"/system_page\">系统信息</a><a class=\"%s\" href=\"/about\">关于</a></nav>"
 		   "<div class=\"sidecard\"><div class=\"pill\">%s</div><div class=\"hint\">接口 %s</div><div class=\"hint\">SSID %s</div></div>"
-		   "</aside><main class=\"page\"><div class=\"topline\"><div><div class=\"h1\">%s</div><div class=\"hint\">%s</div></div><div class=\"topmeta\"><div class=\"pill\">%s</div><div class=\"hint\">IP %s</div></div></div>",
+		   "</aside><main class=\"page\"><div class=\"topline\"><div><div class=\"h1\">%s</div><div class=\"hint\">%s</div></div><div class=\"topmeta\"><div class=\"pill\">%s</div><div class=\"hint\">IP %s</div><a class=\"admin-url\" href=\"%s\">原版后台 %s</a></div></div>",
 		   esc_title, state_color, nav_active(page, WEB_PAGE_HOME),
 		   nav_active(page, WEB_PAGE_INTERFACES),
 		   nav_active(page, WEB_PAGE_SYSTEM),
 		   nav_active(page, WEB_PAGE_ABOUT),
 		   state_label, esc_iface, esc_ssid[0] ? esc_ssid : "-",
 		   esc_title, esc_subtitle, state_label,
-		   esc_ip[0] ? esc_ip : "-");
+		   esc_ip[0] ? esc_ip : "-", esc_admin_url, esc_admin_url);
 	if (message && *message)
 		buf_append(body, bodysz, "<section class=\"msg\">%s</section>",
 			   esc_msg);
@@ -7030,6 +7297,18 @@ static void append_page_start(char *body, size_t bodysz,
 		buf_append(body, bodysz,
 			   "<section class=\"hardware-error\"><strong>硬件不支持</strong><span>%s</span></section>",
 			   esc_hardware[0] ? esc_hardware : "当前设备不支持此 STA/nl80211 功能。");
+	if (st->sta_lan_conflict) {
+		if (esc_suggested_subnet[0] && esc_management_ip[0])
+			buf_append(body, bodysz,
+				   "<section class=\"network-warning\"><strong>检测到网段冲突</strong><span>上游网段 %s 与本地管理网段 %s 重叠。继续使用将切换到 %s，原版后台可通过 <code>http://%s/</code> 访问（切换后地址 <code>http://%s/</code>）。</span></section>",
+				   esc_sta_subnet[0] ? esc_sta_subnet : "未知",
+				   esc_lan_subnet[0] ? esc_lan_subnet : "未知",
+				   esc_suggested_subnet, DEFAULT_ADMIN_HOSTNAME,
+				   esc_management_ip);
+		else
+			buf_append(body, bodysz,
+				   "<section class=\"network-warning\"><strong>检测到网段冲突</strong><span>上游网段与本地管理网段重叠，当前没有找到可用的管理网段。</span></section>");
+	}
 }
 
 static void append_page_end(char *body, size_t bodysz)
@@ -7054,10 +7333,11 @@ static void append_home_content(char *body, size_t bodysz,
 	char esc_relay_lan[128], esc_relay_subnet[128], esc_relay_wan[128];
 	char esc_relay_members[256];
 	char esc_sta_subnet[128], esc_lan_subnet[128];
-	const char *connect_hint;
+	char esc_suggested_subnet[128], esc_management_ip[128];
+	char connect_hint[512];
 	const char *share_state;
 	const char *share_action;
-	const char *share_button;
+	char share_button[160];
 	const char *share_class;
 	int share_ready;
 	int connected;
@@ -7082,22 +7362,51 @@ static void append_home_content(char *body, size_t bodysz,
 		    st->sta_subnet[0] ? st->sta_subnet : "-");
 	html_escape(esc_lan_subnet, sizeof(esc_lan_subnet),
 		    st->lan_subnet[0] ? st->lan_subnet : "-");
+	html_escape(esc_suggested_subnet, sizeof(esc_suggested_subnet),
+		    st->lan_suggested_subnet);
+	html_escape(esc_management_ip, sizeof(esc_management_ip),
+		    st->lan_management_ip);
 	connected = runtime_is_connected(st);
 	share_ready = connected && st->default_route_ready;
-	connect_hint = share_ready && !st->sta_lan_conflict ?
-		       "本设备已通过这个 WiFi 获取地址并具备出口路由" :
-		       st->sta_lan_conflict ?
-		       "已关联 WiFi，但上游网段和热点/USB 网段冲突；开启共享时会自动调整热点/USB 网段" :
-		       connected && !st->default_route_ready ?
-		       "已关联 WiFi，但没有默认网关，暂不能作为外网出口" :
-		       "本设备已通过这个 WiFi 获取地址";
-	share_state = connected && !st->default_route_ready &&
-		      !st->sta_lan_conflict ? "缺少网关" :
+	if (share_ready && !st->sta_lan_conflict)
+		snprintf(connect_hint, sizeof(connect_hint),
+			 "本设备已通过这个 WiFi 获取地址并具备出口路由");
+	else if (st->sta_lan_conflict && esc_suggested_subnet[0] &&
+		 esc_management_ip[0])
+		snprintf(connect_hint, sizeof(connect_hint),
+				 "检测到网段冲突；继续使用将切换本地管理网段至 %s，原版后台可通过 http://%s/ 访问（切换后地址 http://%s/）。",
+				esc_suggested_subnet, DEFAULT_ADMIN_HOSTNAME,
+				esc_management_ip);
+	else if (st->sta_lan_conflict)
+		snprintf(connect_hint, sizeof(connect_hint),
+			 "检测到上游网段和本地管理网段冲突，当前没有找到可用的管理网段。");
+	else if (connected && !st->default_route_ready)
+		snprintf(connect_hint, sizeof(connect_hint),
+			 "已关联 WiFi，但没有默认网关，暂不能作为外网出口");
+	else
+		snprintf(connect_hint, sizeof(connect_hint),
+			 "本设备已通过这个 WiFi 获取地址");
+	share_state = st->sta_lan_conflict ? "待调整网段" :
 		      st->relay_enabled ? "已开启" : "未开启";
-	share_action = st->relay_enabled ? "/relay_off" : "/relay_on";
-	share_button = st->relay_enabled ? "关闭共享网络" :
-		       "共享网络给热点和 USB 设备";
-	share_class = st->relay_enabled ? " class=\"alt\"" : "";
+	if (st->relay_enabled) {
+		share_action = "/relay_off";
+		snprintf(share_button, sizeof(share_button), "关闭共享网络");
+		share_class = " class=\"alt\"";
+	} else if (st->sta_lan_conflict) {
+		share_action = "/relay_fix_lan";
+		if (esc_suggested_subnet[0])
+			snprintf(share_button, sizeof(share_button),
+				 "继续并切换到 %s", esc_suggested_subnet);
+		else
+			snprintf(share_button, sizeof(share_button),
+				 "继续并修复网段");
+		share_class = " class=\"warn\"";
+	} else {
+		share_action = "/relay_on";
+		snprintf(share_button, sizeof(share_button),
+			 "共享网络给热点和 USB 设备");
+		share_class = "";
+	}
 
 	buf_append(body, bodysz,
 		   "<div class=\"summary\">"
@@ -7355,9 +7664,10 @@ static void render_status(int fd, const struct app_config *cfg)
 	char esc_gw[128], esc_dns[256], esc_key[128], esc_iface[128];
 	char esc_dns_path[512], esc_relay_lan[128], esc_relay_subnet[128];
 	char esc_relay_wan[128], esc_sta_subnet[128], esc_lan_subnet[128];
+	char esc_suggested_subnet[128], esc_management_ip[128];
 	char esc_relay_members[256];
 	char esc_hardware[768];
-	char body[4096];
+	char body[8192];
 
 	log_msg(cfg, "render status");
 	get_runtime_status(cfg, &st);
@@ -7378,6 +7688,10 @@ static void render_status(int fd, const struct app_config *cfg)
 	json_escape(esc_relay_wan, sizeof(esc_relay_wan), st.relay_wan_iface);
 	json_escape(esc_sta_subnet, sizeof(esc_sta_subnet), st.sta_subnet);
 	json_escape(esc_lan_subnet, sizeof(esc_lan_subnet), st.lan_subnet);
+	json_escape(esc_suggested_subnet, sizeof(esc_suggested_subnet),
+		    st.lan_suggested_subnet);
+	json_escape(esc_management_ip, sizeof(esc_management_ip),
+		    st.lan_management_ip);
 	json_escape(esc_hardware, sizeof(esc_hardware), st.hardware_reason);
 
 	snprintf(body, sizeof(body),
@@ -7389,6 +7703,7 @@ static void render_status(int fd, const struct app_config *cfg)
 		 "\"hardware_supported\":%d,\"hardware_state\":\"%s\","
 		 "\"hardware_reason\":\"%s\","
 		 "\"sta_subnet\":\"%s\",\"lan_subnet\":\"%s\","
+		 "\"lan_suggested_subnet\":\"%s\",\"lan_management_ip\":\"%s\","
 		 "\"default_route_ready\":%s,\"sta_lan_conflict\":%s,"
 		 "\"relay_enabled\":%s,\"relay_lan_iface\":\"%s\","
 		 "\"relay_lan_members\":\"%s\",\"relay_lan_subnet\":\"%s\","
@@ -7405,8 +7720,9 @@ static void render_status(int fd, const struct app_config *cfg)
 		 st.hardware_supported,
 		 st.hardware_supported > 0 ? "supported" :
 		 st.hardware_supported == 0 ? "unsupported" : "unknown",
-		 esc_hardware,
-		 esc_sta_subnet, esc_lan_subnet,
+		esc_hardware,
+		esc_sta_subnet, esc_lan_subnet,
+		 esc_suggested_subnet, esc_management_ip,
 		 st.default_route_ready ? "true" : "false",
 		 st.sta_lan_conflict ? "true" : "false",
 		 st.relay_enabled ? "true" : "false",
@@ -7501,6 +7817,14 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 {
 	char use_dns1[64];
 	char use_dns2[64];
+	struct runtime_status st;
+	char old_sta_subnet[64];
+	char old_lan_subnet[64];
+	char new_lan_subnet[64];
+	char new_management_ip[INET_ADDRSTRLEN];
+	char network_message[512];
+	char failure_message[1024];
+	int conflict_adjusted = 0;
 
 	if (hardware_probe_supported == 0) {
 		render_page(fd, cfg, hardware_probe_reason, NULL);
@@ -7559,12 +7883,42 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 		render_page(fd, cfg, "WiFi 已连接，但 DHCP 暂未分配 IP。", NULL);
 		return;
 	}
-	if (relay &&
+	memset(old_sta_subnet, 0, sizeof(old_sta_subnet));
+	memset(old_lan_subnet, 0, sizeof(old_lan_subnet));
+	memset(new_lan_subnet, 0, sizeof(new_lan_subnet));
+	memset(new_management_ip, 0, sizeof(new_management_ip));
+	get_runtime_status(cfg, &st);
+	if (st.sta_lan_conflict) {
+		snprintf(old_sta_subnet, sizeof(old_sta_subnet), "%s",
+			 st.sta_subnet);
+		snprintf(old_lan_subnet, sizeof(old_lan_subnet), "%s",
+			 st.lan_subnet);
+		if (!auto_lan) {
+			format_lan_conflict_message(network_message,
+						    sizeof(network_message),
+						    old_sta_subnet, old_lan_subnet,
+						    st.lan_suggested_subnet,
+						    st.lan_management_ip, 0);
+			render_page(fd, cfg, network_message, NULL);
+			return;
+		}
+		if (prepare_relay_route(cfg, use_dns1, use_dns2, auto_lan,
+					new_lan_subnet, sizeof(new_lan_subnet)) < 0) {
+			render_page(fd, cfg,
+				    "WiFi 已连接，但本地管理网段自动调整或默认网关恢复失败。",
+				    NULL);
+			return;
+		}
+		if (new_lan_subnet[0] &&
+		    management_ip_from_cidr(new_lan_subnet,
+					     new_management_ip,
+					     sizeof(new_management_ip)) == 0)
+			conflict_adjusted = 1;
+	}
+	if (relay && !conflict_adjusted &&
 	    prepare_relay_route(cfg, use_dns1, use_dns2, auto_lan, NULL, 0) < 0) {
 		render_page(fd, cfg,
-			    auto_lan ?
-			    "WiFi 已连接，但热点/USB 网段自动调整或默认网关恢复失败。" :
-			    "WiFi 已连接，但上游网段和热点/USB 网段冲突，且已关闭自动调整。",
+			    "WiFi 已连接，但热点/USB 网段自动调整或默认网关恢复失败。",
 			    NULL);
 		return;
 	}
@@ -7575,11 +7929,31 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 	}
 
 	if (relay && start_relay(cfg, use_dns1, use_dns2) < 0) {
-		render_page(fd, cfg, "WiFi 已连接，但中继/NAT 启用失败。", NULL);
+		if (conflict_adjusted) {
+			format_lan_conflict_message(network_message,
+						    sizeof(network_message),
+						    old_sta_subnet, old_lan_subnet,
+					    new_lan_subnet, new_management_ip,
+					    1);
+			snprintf(failure_message, sizeof(failure_message),
+				 "%s 中继/NAT 启用失败；请在新管理地址检查配置。",
+				 network_message);
+			render_page(fd, cfg, failure_message, NULL);
+		} else {
+			render_page(fd, cfg, "WiFi 已连接，但中继/NAT 启用失败。", NULL);
+		}
 		return;
 	}
 
 	log_msg(cfg, "connect completed");
+	if (conflict_adjusted) {
+		format_lan_conflict_message(network_message, sizeof(network_message),
+					    old_sta_subnet, old_lan_subnet,
+					    new_lan_subnet, new_management_ip,
+					    1);
+		render_page(fd, cfg, network_message, NULL);
+		return;
+	}
 	http_redirect(fd, cfg, "/");
 }
 
@@ -7758,7 +8132,14 @@ static void handle_relay_on(int fd, const struct app_config *cfg)
 	struct runtime_status st;
 	char dns1[64];
 	char dns2[64];
+	char old_sta_subnet[64];
+	char old_lan_subnet[64];
+	char new_lan_subnet[64];
+	char new_management_ip[INET_ADDRSTRLEN];
+	char network_message[512];
+	char failure_message[1024];
 	int auto_lan;
+	int conflict_adjusted = 0;
 
 	get_runtime_status(cfg, &st);
 	if (hardware_probe_supported == 0) {
@@ -7777,16 +8158,52 @@ static void handle_relay_on(int fd, const struct app_config *cfg)
 		snprintf(dns2, sizeof(dns2), "%s", DEFAULT_DNS2);
 
 	auto_lan = saved_auto_lan_for_ssid(st.ssid);
-	if (prepare_relay_route(cfg, dns1, dns2, auto_lan, NULL, 0) < 0) {
+	memset(old_sta_subnet, 0, sizeof(old_sta_subnet));
+	memset(old_lan_subnet, 0, sizeof(old_lan_subnet));
+	memset(new_lan_subnet, 0, sizeof(new_lan_subnet));
+	memset(new_management_ip, 0, sizeof(new_management_ip));
+	if (st.sta_lan_conflict) {
+		snprintf(old_sta_subnet, sizeof(old_sta_subnet), "%s",
+			 st.sta_subnet);
+		snprintf(old_lan_subnet, sizeof(old_lan_subnet), "%s",
+			 st.lan_subnet);
+		if (!auto_lan) {
+			format_lan_conflict_message(network_message,
+						    sizeof(network_message),
+						    old_sta_subnet, old_lan_subnet,
+						    st.lan_suggested_subnet,
+						    st.lan_management_ip, 0);
+			render_page(fd, cfg, network_message, NULL);
+			return;
+		}
+	}
+	if (prepare_relay_route(cfg, dns1, dns2, auto_lan,
+				       new_lan_subnet, sizeof(new_lan_subnet)) < 0) {
 		render_page(fd, cfg,
-			    auto_lan ?
-			    "共享网络启用失败：热点/USB 网段自动调整或默认网关恢复失败。" :
-			    "共享网络启用失败：上游网段和热点/USB 网段冲突，且已关闭自动调整。",
+			    "共享网络启用失败：热点/USB 网段自动调整或默认网关恢复失败。",
 			    NULL);
 		return;
 	}
+	if (new_lan_subnet[0] &&
+	    management_ip_from_cidr(new_lan_subnet, new_management_ip,
+				     sizeof(new_management_ip)) == 0)
+		conflict_adjusted = 1;
 	if (start_relay(cfg, dns1, dns2) < 0) {
-		render_page(fd, cfg, "共享网络启用失败，请检查 br0、iptables 和日志。", NULL);
+		if (conflict_adjusted) {
+			format_lan_conflict_message(network_message,
+						    sizeof(network_message),
+						    old_sta_subnet, old_lan_subnet,
+						    new_lan_subnet, new_management_ip,
+						    1);
+			snprintf(failure_message, sizeof(failure_message),
+				 "%s 共享网络启用失败；请在新管理地址检查配置。",
+				 network_message);
+			render_page(fd, cfg, failure_message, NULL);
+		} else {
+			render_page(fd, cfg,
+				    "共享网络启用失败，请检查 br0、iptables 和日志。",
+				    NULL);
+		}
 		return;
 	}
 
@@ -7794,6 +8211,14 @@ static void handle_relay_on(int fd, const struct app_config *cfg)
 		log_msg(cfg, "relay preference save failed ssid=%s errno=%d",
 			st.ssid, errno);
 	log_msg(cfg, "relay enabled by webui");
+	if (conflict_adjusted) {
+		format_lan_conflict_message(network_message, sizeof(network_message),
+					    old_sta_subnet, old_lan_subnet,
+					    new_lan_subnet, new_management_ip,
+					    1);
+		render_page(fd, cfg, network_message, NULL);
+		return;
+	}
 	render_page(fd, cfg, "已开启共享网络。", NULL);
 }
 
@@ -7802,6 +8227,11 @@ static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
 	struct runtime_status st;
 	uint32_t net_host;
 	char new_subnet[64];
+	char old_sta_subnet[64];
+	char old_lan_subnet[64];
+	char new_management_ip[INET_ADDRSTRLEN];
+	char network_message[512];
+	char failure_message[1024];
 	char dns1[64];
 	char dns2[64];
 
@@ -7814,6 +8244,8 @@ static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
 		http_redirect(fd, cfg, "/");
 		return;
 	}
+	snprintf(old_sta_subnet, sizeof(old_sta_subnet), "%s", st.sta_subnet);
+	snprintf(old_lan_subnet, sizeof(old_lan_subnet), "%s", st.lan_subnet);
 	if (choose_lan_subnet(&net_host) < 0) {
 		render_page(fd, cfg, "没有找到可用的热点/USB 网段。", NULL);
 		return;
@@ -7828,27 +8260,48 @@ static void handle_relay_fix_lan(int fd, const struct app_config *cfg)
 		render_page(fd, cfg, "热点/USB 网段调整失败，请查看日志。", NULL);
 		return;
 	}
+	if (management_ip_from_cidr(new_subnet, new_management_ip,
+				     sizeof(new_management_ip)) < 0) {
+		render_page(fd, cfg, "已调整本地网段，但新的管理地址解析失败。", NULL);
+		return;
+	}
 
 	stop_dhcp(cfg);
 	if (start_dhcp(cfg, DEFAULT_DNS1, DEFAULT_DNS2, 1) < 0 ||
 	    wait_ipv4_ready(cfg, 8000) < 0 ||
 	    wait_default_route_ready(cfg, 5000) < 0) {
-		render_page(fd, cfg,
-			    "热点/USB 网段已调整，但 WiFi 出口 DHCP 还没有恢复。",
-			    NULL);
+		format_lan_conflict_message(network_message,
+					    sizeof(network_message),
+					    old_sta_subnet, old_lan_subnet,
+					    new_subnet, new_management_ip,
+					    1);
+		snprintf(failure_message, sizeof(failure_message),
+			 "%s WiFi 出口 DHCP 还没有恢复。",
+			 network_message);
+		render_page(fd, cfg, failure_message, NULL);
 		return;
 	}
 	if (start_relay(cfg, dns1, dns2) < 0) {
-		render_page(fd, cfg,
-			    "热点/USB 网段已调整，但共享网络启用失败。",
-			    NULL);
+		format_lan_conflict_message(network_message,
+					    sizeof(network_message),
+					    old_sta_subnet, old_lan_subnet,
+					    new_subnet, new_management_ip,
+					    1);
+		snprintf(failure_message, sizeof(failure_message),
+			 "%s 共享网络启用失败。",
+			 network_message);
+		render_page(fd, cfg, failure_message, NULL);
 		return;
 	}
 	if (st.ssid[0] && set_saved_relay(st.ssid, 1) < 0)
 		log_msg(cfg, "relay preference save failed ssid=%s errno=%d",
 			st.ssid, errno);
 	log_msg(cfg, "relay fix lan completed subnet=%s", new_subnet);
-	render_page(fd, cfg, "已调整热点/USB 网段并开启共享网络。", NULL);
+	format_lan_conflict_message(network_message, sizeof(network_message),
+				    old_sta_subnet, old_lan_subnet,
+				    new_subnet, new_management_ip,
+				    1);
+	render_page(fd, cfg, network_message, NULL);
 }
 
 static void handle_relay_off(int fd, const struct app_config *cfg)
@@ -7896,11 +8349,11 @@ static void handle_set_port(int fd, const struct app_config *cfg,
 		 "<style>body{margin:0;font-family:Arial,'Microsoft YaHei',sans-serif;background:#f4f8f2;color:#18251d}"
 		 ".box{max-width:560px;margin:12vh auto;padding:22px;background:#fff;border:1px solid #d9e5dc;border-radius:8px;box-shadow:0 8px 24px rgba(24,37,29,.06)}"
 		 ".h{font-size:22px;font-weight:800}.p{color:#55685c;line-height:1.7}.a{display:inline-block;margin-top:10px;color:#1f6d42;font-weight:800}</style>"
-		 "</head><body><div class=\"box\"><div class=\"h\">WebUI 端口已保存</div>"
-		 "<div class=\"p\">服务正在切换到 %d 端口。请打开新地址继续访问。</div>"
-		 "<a class=\"a\" href=\"http://127.0.0.1:%d/\">http://127.0.0.1:%d/</a>"
-		 "</div></body></html>",
-		 port, port, port);
+			 "</head><body><div class=\"box\"><div class=\"h\">WebUI 端口已保存</div>"
+			 "<div class=\"p\">服务正在切换到 %d 端口。请打开新地址继续访问。</div>"
+			 "<a class=\"a\" href=\"http://127.0.0.1:%d/\">http://127.0.0.1:%d/</a>"
+			 "</div></body></html>",
+			 port, port, port);
 	http_send(fd, cfg, 200, "OK", "text/html; charset=utf-8", response);
 	request_webui_restart(cfg, port);
 }
@@ -8086,6 +8539,7 @@ static int run_webui(const struct app_config *cfg)
 	struct sockaddr_in addr;
 
 	probe_hardware(cfg);
+	sync_webui_hostname(cfg);
 
 	s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s < 0) {

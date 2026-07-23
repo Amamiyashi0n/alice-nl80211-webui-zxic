@@ -360,6 +360,7 @@ nameserver 119.29.29.29
 - DHCP 只下发普通 `router` 和 `dns` 选项，不下发 classless static default route，因此不会主动覆盖 Windows 当前 WLAN 等已有网络优先级。
 - 对目标系统内核无法正常从 `wlan0-vxd` 发出转发包的情况，程序会启动轻量用户态 raw packet 转发，作为 USB/RNDIS 与 STA 出口之间的补充转发路径。
 - 同步 `/etc_rw/resolv.conf` 并通知 `dnsmasq` 重载，因为系统 `dnsmasq -i br0 -r /etc_rw/resolv.conf` 会服务下层客户端。
+- WebUI 启动时会在 `/mnt/userdata/etc_rw/zxic-admin-webui.hosts` 写入当前 `br0` 地址，并让用户态 `dnsmasq` 提供 `zxic-admin-webui` 解析。该别名用于访问原版 HTTP 后台（原默认地址 `192.168.0.1`，端口 80），网段切换后会同步更新到新的 LAN 地址；客户端使用目标设备 DHCP/DNS 时，可通过 `http://zxic-admin-webui/` 访问。
 - 断开或下次重连前只删除 `wpa_mini` 自己创建的精确匹配规则，不清空系统防火墙。
 
 ## 已保存 WiFi
@@ -440,6 +441,7 @@ make distclean
 - 目标设备需要有可用无线接口，例如 `wlan0-vxd`。
 - 目标设备需要存在 `/sbin/udhcpc`。
 - 使用 WiFi 中继/NAT 时，目标设备需要存在 `iptables`，并保留系统原有 `br0`、`dnsmasq`、`udhcpd` 服务。
+- 使用原版后台别名时，目标设备需要存在 `/bin/dnsmasq`；客户端需要把目标设备作为 DNS 服务器。否则可继续通过当前 LAN 地址访问原版后台。
 - 使用 `wpa_mini.run` 时，目标设备需要存在 `sed` 和 `unzip`。当前目标设备的 BusyBox `unzip` 可用。
 - 程序通常需要 root 权限或足够的网络控制权限。
 - 设备防火墙需要允许访问 `51400` 端口。
