@@ -1,0 +1,288 @@
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -2300,11 +2300,6 @@
+ 				   bss->brname, strerror(errno));
+ 	}
+ 
+-	nl80211_remove_monitor_interface(drv);
+-
+-	if (is_ap_interface(drv->nlmode))
+-		wpa_driver_nl80211_del_beacon(drv);
+-
+ 	if (drv->eapol_sock >= 0) {
+ 		eloop_unregister_read_sock(drv->eapol_sock);
+ 		close(drv->eapol_sock);
+@@ -3086,12 +3081,6 @@
+ 		freq = bss->freq;
+ 	}
+ 
+-	if (drv->use_monitor) {
+-		wpa_printf(MSG_DEBUG, "nl80211: send_frame(freq=%u bss->freq=%u) -> send_monitor",
+-			   freq, bss->freq);
+-		return nl80211_send_monitor(drv, data, len, encrypt, noack);
+-	}
+-
+ 	wpa_printf(MSG_DEBUG, "nl80211: send_frame -> send_frame_cmd");
+ 	res = nl80211_send_frame_cmd(bss, freq, wait_time, data, len,
+ 				     &cookie, no_cck, noack, offchanok);
+@@ -3231,6 +3220,7 @@
+ }
+ 
+ 
++#ifndef CONFIG_NO_NL80211_AP
+ static int wpa_driver_nl80211_set_acl(void *priv,
+ 				      struct hostapd_acl_params *params)
+ {
+@@ -3278,6 +3268,8 @@
+ }
+ 
+ 
++#endif /* CONFIG_NO_NL80211_AP */
++
+ static int nl80211_put_beacon_int(struct nl_msg *msg, int beacon_int)
+ {
+ 	if (beacon_int > 0) {
+@@ -3290,6 +3282,7 @@
+ }
+ 
+ 
++#ifndef CONFIG_NO_NL80211_AP
+ static int wpa_driver_nl80211_set_ap(void *priv,
+ 				     struct wpa_driver_ap_params *params)
+ {
+@@ -3525,6 +3518,8 @@
+ }
+ 
+ 
++#endif /* CONFIG_NO_NL80211_AP */
++
+ static int nl80211_put_freq_params(struct nl_msg *msg,
+ 				   const struct hostapd_freq_params *freq)
+ {
+@@ -4079,6 +4074,7 @@
+ }
+ 
+ 
++#ifndef CONFIG_NO_NL80211_AP
+ static int nl80211_setup_ap(struct i802_bss *bss)
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+@@ -4136,6 +4132,8 @@
+ 	bss->beacon_set = 0;
+ }
+ 
++#endif /* CONFIG_NO_NL80211_AP */
++
+ 
+ static int nl80211_send_eapol_data(struct i802_bss *bss,
+ 				   const u8 *addr, const u8 *data,
+@@ -4283,6 +4281,7 @@
+ }
+ 
+ 
++#ifndef CONFIG_NO_NL80211_AP
+ static int wpa_driver_nl80211_ap(struct wpa_driver_nl80211_data *drv,
+ 				 struct wpa_driver_associate_params *params)
+ {
+@@ -4312,6 +4311,8 @@
+ 	return 0;
+ }
+ 
++#endif /* CONFIG_NO_NL80211_AP */
++
+ 
+ static int nl80211_leave_ibss(struct wpa_driver_nl80211_data *drv,
+ 			      int reset_mode)
+@@ -4765,8 +4766,10 @@
+ 
+ 	nl80211_unmask_11b_rates(bss);
+ 
++	#ifndef CONFIG_NO_NL80211_AP
+ 	if (params->mode == IEEE80211_MODE_AP)
+ 		return wpa_driver_nl80211_ap(drv, params);
++	#endif /* CONFIG_NO_NL80211_AP */
+ 
+ 	if (params->mode == IEEE80211_MODE_IBSS)
+ 		return wpa_driver_nl80211_ibss(drv, params);
+@@ -4851,7 +4854,9 @@
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	int ret = -1;
+ 	int i;
++#ifndef CONFIG_NO_NL80211_AP
+ 	int was_ap = is_ap_interface(drv->nlmode);
++#endif /* CONFIG_NO_NL80211_AP */
+ 	int res;
+ 	int mode_switch_res;
+ 
+@@ -4950,6 +4955,7 @@
+ 		nl80211_disable_11b_rates(drv, drv->ifindex, 0);
+ 	}
+ 
++	#ifndef CONFIG_NO_NL80211_AP
+ 	if (is_ap_interface(nlmode)) {
+ 		nl80211_mgmt_unsubscribe(bss, "start AP");
+ 		/* Setup additional AP mode functionality if needed */
+@@ -4959,6 +4965,9 @@
+ 		/* Remove additional AP mode functionality */
+ 		nl80211_teardown_ap(bss);
+ 	} else {
++	#else /* CONFIG_NO_NL80211_AP */
++	{
++	#endif /* CONFIG_NO_NL80211_AP */
+ 		nl80211_mgmt_unsubscribe(bss, "mode change");
+ 	}
+ 
+@@ -4966,7 +4975,11 @@
+ 	    nl80211_mgmt_subscribe_mesh(bss))
+ 		return -1;
+ 
+-	if (!bss->in_deinit && !is_ap_interface(nlmode) &&
++	if (!bss->in_deinit
++#ifndef CONFIG_NO_NL80211_AP
++	    && !is_ap_interface(nlmode)
++#endif /* CONFIG_NO_NL80211_AP */
++	    &&
+ 	    !is_mesh_interface(nlmode) &&
+ 	    nl80211_mgmt_subscribe_non_ap(bss) < 0)
+ 		wpa_printf(MSG_DEBUG, "nl80211: Failed to register Action "
+@@ -5938,6 +5951,7 @@
+ 	}
+ #endif /* CONFIG_P2P || CONFIG_MESH */
+ 
++#ifndef CONFIG_NO_NL80211_AP
+ 	if (type == WPA_IF_AP_BSS) {
+ 		struct i802_bss *new_bss = os_zalloc(sizeof(*new_bss));
+ 		if (new_bss == NULL) {
+@@ -5981,6 +5995,7 @@
+ 		if (nl80211_setup_ap(new_bss))
+ 			return -1;
+ 	}
++#endif /* CONFIG_NO_NL80211_AP */
+ 
+ 	if (drv->global)
+ 		drv->global->if_add_ifindex = ifidx;
+@@ -6018,6 +6033,7 @@
+ 			del_ifidx(drv2, ifindex);
+ 	}
+ 
++	#ifndef CONFIG_NO_NL80211_AP
+ 	if (type != WPA_IF_AP_BSS)
+ 		return 0;
+ 
+@@ -6071,6 +6087,7 @@
+ 			wpa_printf(MSG_DEBUG, "nl80211: No second BSS to reassign context to");
+ 		}
+ 	}
++	#endif /* CONFIG_NO_NL80211_AP */
+ 
+ 	return 0;
+ }
+@@ -8453,12 +8470,12 @@
+ 	.set_supp_port = wpa_driver_nl80211_set_supp_port,
+ 	.set_country = wpa_driver_nl80211_set_country,
+ 	.get_country = wpa_driver_nl80211_get_country,
++#ifndef CONFIG_NO_NL80211_AP
+ 	.set_ap = wpa_driver_nl80211_set_ap,
+ 	.set_acl = wpa_driver_nl80211_set_acl,
+-	.if_add = wpa_driver_nl80211_if_add,
+-	.if_remove = driver_nl80211_if_remove,
+-	.send_mlme = driver_nl80211_send_mlme,
++#endif /* CONFIG_NO_NL80211_AP */
+ 	.get_hw_feature_data = nl80211_get_hw_feature_data,
++#ifndef CONFIG_NO_NL80211_AP
+ 	.sta_add = wpa_driver_nl80211_sta_add,
+ 	.sta_remove = driver_nl80211_sta_remove,
+ 	.hapd_send_eapol = wpa_driver_nl80211_hapd_send_eapol,
+@@ -8477,41 +8494,34 @@
+ 	.sta_deauth = i802_sta_deauth,
+ 	.sta_disassoc = i802_sta_disassoc,
+ 	.read_sta_data = driver_nl80211_read_sta_data,
+-	.set_freq = i802_set_freq,
++#endif /* CONFIG_NO_NL80211_AP */
+ 	.send_action = driver_nl80211_send_action,
+ 	.send_action_cancel_wait = wpa_driver_nl80211_send_action_cancel_wait,
+ 	.remain_on_channel = wpa_driver_nl80211_remain_on_channel,
+ 	.cancel_remain_on_channel =
+-	wpa_driver_nl80211_cancel_remain_on_channel,
++	 wpa_driver_nl80211_cancel_remain_on_channel,
++#ifndef CONFIG_NO_NL80211_AP
+ 	.probe_req_report = driver_nl80211_probe_req_report,
+ 	.deinit_ap = wpa_driver_nl80211_deinit_ap,
+ 	.deinit_p2p_cli = wpa_driver_nl80211_deinit_p2p_cli,
+-	.resume = wpa_driver_nl80211_resume,
+-	.signal_monitor = nl80211_signal_monitor,
+-	.signal_poll = nl80211_signal_poll,
+-	.send_frame = nl80211_send_frame,
+ 	.shared_freq = wpa_driver_nl80211_shared_freq,
+-	.set_param = nl80211_set_param,
+-	.get_radio_name = nl80211_get_radio_name,
++#endif /* CONFIG_NO_NL80211_AP */
++	.resume = wpa_driver_nl80211_resume,
+ 	.add_pmkid = nl80211_add_pmkid,
+ 	.remove_pmkid = nl80211_remove_pmkid,
+ 	.flush_pmkid = nl80211_flush_pmkid,
+ 	.set_rekey_info = nl80211_set_rekey_info,
+-	.poll_client = nl80211_poll_client,
+-	.set_p2p_powersave = nl80211_set_p2p_powersave,
++#ifndef CONFIG_NO_NL80211_AP
+ 	.start_dfs_cac = nl80211_start_radar_detection,
+ 	.stop_ap = wpa_driver_nl80211_stop_ap,
++#endif /* CONFIG_NO_NL80211_AP */
+ #ifdef CONFIG_TDLS
+ 	.send_tdls_mgmt = nl80211_send_tdls_mgmt,
+ 	.tdls_oper = nl80211_tdls_oper,
+ 	.tdls_enable_channel_switch = nl80211_tdls_enable_channel_switch,
+ 	.tdls_disable_channel_switch = nl80211_tdls_disable_channel_switch,
+ #endif /* CONFIG_TDLS */
+-	.update_ft_ies = wpa_driver_nl80211_update_ft_ies,
+ 	.get_mac_addr = wpa_driver_nl80211_get_macaddr,
+-	.get_survey = wpa_driver_nl80211_get_survey,
+-	.status = wpa_driver_nl80211_status,
+-	.switch_channel = nl80211_switch_channel,
+ #ifdef ANDROID_P2P
+ 	.set_noa = wpa_driver_set_p2p_noa,
+ 	.get_noa = wpa_driver_get_p2p_noa,
+@@ -8520,21 +8530,9 @@
+ #ifdef ANDROID
+ 	.driver_cmd = wpa_driver_nl80211_driver_cmd,
+ #endif /* ANDROID */
+-	.vendor_cmd = nl80211_vendor_cmd,
+-	.set_qos_map = nl80211_set_qos_map,
+-	.set_wowlan = nl80211_set_wowlan,
+-	.roaming = nl80211_roaming,
+-	.set_mac_addr = nl80211_set_mac_addr,
+ #ifdef CONFIG_MESH
+ 	.init_mesh = wpa_driver_nl80211_init_mesh,
+ 	.join_mesh = wpa_driver_nl80211_join_mesh,
+ 	.leave_mesh = wpa_driver_nl80211_leave_mesh,
+ #endif /* CONFIG_MESH */
+-	.br_add_ip_neigh = wpa_driver_br_add_ip_neigh,
+-	.br_delete_ip_neigh = wpa_driver_br_delete_ip_neigh,
+-	.br_port_set_attr = wpa_driver_br_port_set_attr,
+-	.br_set_net_param = wpa_driver_br_set_net_param,
+-	.add_tx_ts = nl80211_add_ts,
+-	.del_tx_ts = nl80211_del_ts,
+-	.do_acs = wpa_driver_do_acs,
+ };
+--- a/src/drivers/drivers.mak
++++ b/src/drivers/drivers.mak
+@@ -27,9 +27,19 @@
+ DRV_OBJS += ../src/drivers/driver_nl80211.o
+ DRV_OBJS += ../src/drivers/driver_nl80211_capa.o
+ DRV_OBJS += ../src/drivers/driver_nl80211_event.o
++ifndef CONFIG_NO_NL80211_MONITOR
+ DRV_OBJS += ../src/drivers/driver_nl80211_monitor.o
++endif
+ DRV_OBJS += ../src/drivers/driver_nl80211_scan.o
++ifndef CONFIG_NO_NL80211_MONITOR
+ DRV_OBJS += ../src/utils/radiotap.o
++endif
++ifdef CONFIG_NO_NL80211_AP
++DRV_CFLAGS += -DCONFIG_NO_NL80211_AP
++endif
++ifdef CONFIG_NO_NL80211_MONITOR
++DRV_CFLAGS += -DCONFIG_NO_NL80211_MONITOR
++endif
+ NEED_SME=y
+ NEED_AP_MLME=y
+ NEED_NETLINK=y

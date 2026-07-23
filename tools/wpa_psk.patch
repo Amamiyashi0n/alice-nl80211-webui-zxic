@@ -1,0 +1,20 @@
+diff --git a/wpa_supplicant/config.c b/wpa_supplicant/config.c
+--- a/wpa_supplicant/config.c
++++ b/wpa_supplicant/config.c
+@@ -2515,5 +2515,7 @@
+  * elements.
+  */
++/* WPA_MINI_NO_CONFIG_GET_ALL */
++#ifndef NO_CONFIG_WRITE
+ char ** wpa_config_get_all(struct wpa_ssid *ssid, int get_keys)
+ {
+ 	const struct parse_data *field;
+@@ -2563,6 +2565,8 @@
+ 	return NULL;
+ }
+ 
++#endif /* NO_CONFIG_WRITE */
++
+ 
+ #ifndef NO_CONFIG_WRITE
+ /**

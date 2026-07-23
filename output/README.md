@@ -4,11 +4,17 @@
 
 ## 文件内容
 
-- `wpa_mini`: 目标设备使用的 ARM 32-bit 静态可执行文件，已 strip。
+- `wpa_mini`: 目标设备使用的 ARM 32-bit 动态可执行文件，已 strip。
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `612680` 字节，`wpa_mini.run` 大小为 `359125` 字节。`wpa_mini` 是单一可执行文件，已经把精简 STA 连接引擎、WebUI 头像和赞助二维码资源链接进程序内部，不需要额外交付 `wpa_cli`、外部 `wpa_supplicant` 或图片文件。
+当前生成的 `wpa_mini` 大小为 `285496` 字节，`wpa_mini.run` 大小为 `162701` 字节。`wpa_mini` 是单一可执行文件，已经把纯 WPA2-PSK STA 连接引擎、WebUI 头像和赞助二维码资源链接进程序内部，不需要额外交付 `wpa_cli`、外部 `wpa_supplicant` 或图片文件。动态依赖由目标设备提供：`ld-uClibc.so.0`、uClibc、libnl-3、libnl-genl-3、libpthread、libm、librt、libdl 和 `libgcc_s`。
+
+## WPA2-PSK 子集
+
+默认构建只保留 `nl80211` STA、扫描、RSN/WPA-PSK、AES-CCMP、EAPOL 四次握手和 PBKDF2-SHA1。企业认证、EAP-TLS、证书校验、WPS、P2P、AP/热点和上游 Unix `ctrl_iface` 不在默认 profile 中。配置固定为 `key_mgmt=WPA-PSK`、`proto=RSN`、`pairwise=CCMP`、`group=CCMP`。
+
+链接阶段同时移除了 nl80211 AP/monitor/radiotap、WMM-AC、虚拟接口管理以及未使用的控制和诊断回调；该输出只面向普通 WPA2-PSK STA 连接。
 
 ## 功能
 

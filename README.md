@@ -10,6 +10,41 @@
 
 ## 使用
 
+默认使用目标设备的动态运行库编译：
+
+```sh
+./make.sh
+```
+
+默认编译器是 `arm-linux-gnueabi-gcc`，并使用动态链接。如果 `.build/dynamic-lib` 还没有目标库，构建会通过 `adb -P 5038` 从在线的非模拟器设备读取 `/lib` 中的运行库；也可以预先设置 `ADB_SERIAL` 指定设备。
+
+最终程序依赖目标设备已有的以下共享库，库本身不会打进 `.run`：
+
+```text
+/lib/ld-uClibc.so.0
+/lib/libc.so.0       /lib/libdl.so.0      /lib/libm.so.0
+/lib/libpthread.so.0 /lib/librt.so.0      /lib/libgcc_s.so.1
+/lib/libnl-3.so.200  /lib/libnl-genl-3.so.200
+```
+
+如需构建静态对照版本：
+
+```sh
+make LINK_MODE=static output/wpa_mini.run
+```
+
+动态版本只将 `nl80211`、配置解析和 WebUI 逻辑编入主程序，系统 libc、libnl、线程和数学库由目标设备在运行时提供，以减少交付体积。
+
+默认构建的是纯 WPA2-PSK 的 nl80211 子集：
+
+- 只保留 STA 扫描、RSN/WPA-PSK、AES-CCMP、EAPOL 四次握手和 PBKDF2-SHA1。
+- 不编译企业认证、EAP-TLS、证书校验、WPS、P2P、AP/热点和上游 Unix `ctrl_iface`。
+- 引擎配置只接受 `key_mgmt=WPA-PSK`、`proto=RSN`、`pairwise=CCMP`、`group=CCMP`。
+- 最终链接还裁掉 nl80211 AP/monitor/radiotap、WMM-AC、虚拟接口管理和未使用的控制/诊断回调；因此该 profile 只支持普通 STA 连接。
+- WebUI 使用一个很小的本地数据报控制层提供 `PING`、`STATUS`、`SCAN`、`SCAN_RESULTS` 和 `TERMINATE`。
+
+如需构建旧的完整引擎对照版本，可显式使用 `WPA_PROFILE=full`；它不是默认交付 profile。
+
 推送到目标设备：
 
 ```sh

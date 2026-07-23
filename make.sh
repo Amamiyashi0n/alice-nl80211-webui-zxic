@@ -4,11 +4,10 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ROOT_DIR"
 
-CROSS_ROOT=${CROSS_ROOT:-"$ROOT_DIR/cross_toolchain"}
-TOOLCHAIN_BIN="$CROSS_ROOT/bin"
+TARGET_CC=${TARGET_CC:-arm-linux-gnueabi-gcc}
 
-if [ ! -d "$TOOLCHAIN_BIN" ]; then
-	echo "错误：交叉工具链目录不存在: $TOOLCHAIN_BIN" >&2
+if ! command -v "$TARGET_CC" >/dev/null 2>&1; then
+	echo "错误：找不到 ARM 交叉编译器: $TARGET_CC" >&2
 	exit 1
 fi
 
@@ -17,10 +16,6 @@ if [ ! -x "$ROOT_DIR/tools/make_self_extract.sh" ]; then
 	exit 1
 fi
 
-export PATH="$TOOLCHAIN_BIN:$PATH"
-
-make output/wpa_mini
-make strip
 make output/wpa_mini.run
 
 echo "构建完成："

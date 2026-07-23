@@ -32,6 +32,8 @@
 #include "../.build/avatar_asset.h"
 #include "../.build/sponsor_asset.h"
 
+void dynamic_runtime_init(void);
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -293,6 +295,20 @@ struct system_snapshot {
 	int fs_count;
 };
 
+static void write_fd_text(int fd, const char *text)
+{
+	const char *p = text;
+	size_t left = strlen(text);
+
+	while (left > 0) {
+		ssize_t n = write(fd, p, left);
+		if (n <= 0)
+			break;
+		p += n;
+		left -= (size_t)n;
+	}
+}
+
 /*
  * Makefile links the reduced wpa_supplicant engine into this binary and
  * renames its main() symbol to wpa_engine_main. The weak fallback only keeps
@@ -302,7 +318,7 @@ __attribute__((weak)) int wpa_engine_main(int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
-	fprintf(stderr, "internal WPA engine is not linked\n");
+	write_fd_text(2, "internal WPA engine is not linked\n");
 	return 127;
 }
 
@@ -318,9 +334,9 @@ static int is_hex_chars(const char *s, size_t len)
 	return 1;
 }
 
-static void usage(FILE *out)
+static void usage(int fd)
 {
-	fprintf(out,
+	static const char text[] =
 		"Usage:\n"
 		"  wpa_mini [options]                 start WebUI on port 51400\n"
 		"  wpa_mini -i IFACE -s SSID -p PSK   connect once with internal engine\n"
@@ -343,7 +359,8 @@ static void usage(FILE *out)
 		"  -N         enable WiFi relay/NAT from br0 to STA; implies -M\n"
 		"  -F         keep foreground parent alive in one-shot mode\n"
 		"  -n         write/check config only in one-shot mode\n"
-		"  -h         show this help\n");
+		"  -h         show this help\n";
+	write_fd_text(fd, text);
 }
 
 static long long now_ms(void)
@@ -1275,12 +1292,12 @@ static int write_config(const char *path, const char *ctrl_dir,
 	FILE *fp;
 
 	if (strlen(ssid) == 0 || strlen(ssid) > 32) {
-		fprintf(stderr, "SSID must be 1-32 bytes\n");
+		write_fd_text(2, "SSID must be 1-32 bytes\n");
 		return -1;
 	}
 
 	if (!valid_psk(psk)) {
-		fprintf(stderr, "PSK must be 8-63 bytes or a 64-hex key\n");
+		write_fd_text(2, "PSK must be 8-63 bytes or a 64-hex key\n");
 		return -1;
 	}
 
@@ -1315,10 +1332,11 @@ static int write_config(const char *path, const char *ctrl_dir,
 	fprintf(fp, "\n");
 	if (hidden)
 		fprintf(fp, "\tscan_ssid=1\n");
+	/* The PSK profile deliberately accepts RSN/CCMP only. */
 	fprintf(fp, "\tkey_mgmt=WPA-PSK\n");
-	fprintf(fp, "\tproto=WPA RSN\n");
-	fprintf(fp, "\tpairwise=CCMP TKIP\n");
-	fprintf(fp, "\tgroup=CCMP TKIP\n");
+	fprintf(fp, "\tproto=RSN\n");
+	fprintf(fp, "\tpairwise=CCMP\n");
+	fprintf(fp, "\tgroup=CCMP\n");
 	fprintf(fp, "\tpsk=");
 	write_psk_value(fp, ssid, psk);
 	fprintf(fp, "\n}\n");
@@ -1790,7 +1808,7 @@ static int write_dhcp_script(const struct app_config *cfg,
 	const char *effective_dns2;
 
 	if (!valid_ipv4_or_empty(dns1) || !valid_ipv4_or_empty(dns2)) {
-		fprintf(stderr, "DNS must be IPv4 addresses\n");
+		write_fd_text(2, "DNS must be IPv4 addresses\n");
 		return -1;
 	}
 	effective_dns1 = (dns1 && *dns1) ? dns1 : DEFAULT_DNS1;
@@ -7961,7 +7979,7 @@ static int run_webui(const struct app_config *cfg)
 	printf("interface=%s conf=%s dns=%s engine=internal\n",
 	       cfg->iface, cfg->conf, cfg->dns_path);
 	printf("log=%s\n", cfg->log_path);
-	fflush(stdout);
+	fflush(NULL);
 
 	for (;;) {
 		int c = accept(s, NULL, NULL);
@@ -8005,6 +8023,8 @@ int main(int argc, char **argv)
 	int relay = 0;
 	int web = 0;
 	int opt;
+
+	dynamic_runtime_init();
 
 	cfg.iface = DEFAULT_IFACE;
 	cfg.conf = DEFAULT_CONF;
@@ -8077,10 +8097,10 @@ int main(int argc, char **argv)
 			dry_run = 1;
 			break;
 		case 'h':
-			usage(stdout);
+			usage(1);
 			return 0;
 		default:
-			usage(stderr);
+			usage(2);
 			return 2;
 		}
 	}
@@ -8091,7 +8111,7 @@ int main(int argc, char **argv)
 		argc, cfg.iface, cfg.port, web);
 
 	if (cfg.port <= 0 || cfg.port > 65535) {
-		fprintf(stderr, "invalid port\n");
+		write_fd_text(2, "invalid port\n");
 		log_msg(&cfg, "invalid port=%d", cfg.port);
 		return 2;
 	}
@@ -8100,13 +8120,13 @@ int main(int argc, char **argv)
 		return run_webui(&cfg);
 
 	if ((ssid && !psk) || (!ssid && psk)) {
-		fprintf(stderr, "-s SSID and -p PSK must be used together\n");
+		write_fd_text(2, "-s SSID and -p PSK must be used together\n");
 		return 2;
 	}
 
 	if (!ssid || !psk) {
-		fprintf(stderr, "missing -s SSID -p PSK for one-shot mode\n");
-		usage(stderr);
+		write_fd_text(2, "missing -s SSID -p PSK for one-shot mode\n");
+		usage(2);
 		return 2;
 	}
 
@@ -8119,8 +8139,7 @@ int main(int argc, char **argv)
 		       cfg.driver, cfg.iface, cfg.conf);
 		printf("dns path: %s\n", cfg.dns_path);
 		log_msg(&cfg, "dry-run complete");
-		fflush(stdout);
-		fflush(stderr);
+		fflush(NULL);
 		_exit(0);
 	}
 
@@ -8129,31 +8148,31 @@ int main(int argc, char **argv)
 	deconfigure_iface(&cfg);
 
 	if (start_engine_process(&cfg) < 0) {
-		fprintf(stderr, "failed to start internal WPA engine\n");
+		write_fd_text(2, "failed to start internal WPA engine\n");
 		log_msg(&cfg, "one-shot engine start failed");
 		return 1;
 	}
 
 	if (wait_wpa_completed(&cfg, 20000) < 0) {
-		fprintf(stderr, "warning: WPA state did not reach COMPLETED yet\n");
+		write_fd_text(2, "warning: WPA state did not reach COMPLETED yet\n");
 		log_msg(&cfg, "one-shot association timeout");
 		stop_engine(&cfg);
 		return 1;
 	}
 
 	if (start_dhcp(&cfg, DEFAULT_DNS1, DEFAULT_DNS2, use_default_route) < 0)
-		fprintf(stderr, "warning: failed to start udhcpc\n");
+		write_fd_text(2, "warning: failed to start udhcpc\n");
 	else if (wait_ipv4_ready(&cfg, 8000) < 0)
-		fprintf(stderr, "warning: DHCP has not assigned an IP yet\n");
+		write_fd_text(2, "warning: DHCP has not assigned an IP yet\n");
 	else if (relay &&
 		 prepare_relay_route(&cfg, DEFAULT_DNS1, DEFAULT_DNS2,
 				     1, NULL, 0) < 0)
-		fprintf(stderr, "warning: failed to prepare WiFi relay route\n");
+		write_fd_text(2, "warning: failed to prepare WiFi relay route\n");
 	else if (!relay && use_default_route &&
 		 wait_default_route_ready(&cfg, 5000) < 0)
-		fprintf(stderr, "warning: default route is not ready yet\n");
+		write_fd_text(2, "warning: default route is not ready yet\n");
 	else if (relay && start_relay(&cfg, DEFAULT_DNS1, DEFAULT_DNS2) < 0)
-		fprintf(stderr, "warning: failed to enable WiFi relay/NAT\n");
+		write_fd_text(2, "warning: failed to enable WiFi relay/NAT\n");
 
 	log_msg(&cfg, "one-shot completed foreground=%d relay=%d",
 		foreground, relay);
@@ -8162,7 +8181,6 @@ int main(int argc, char **argv)
 			pause();
 	}
 
-	fflush(stdout);
-	fflush(stderr);
+	fflush(NULL);
 	_exit(0);
 }

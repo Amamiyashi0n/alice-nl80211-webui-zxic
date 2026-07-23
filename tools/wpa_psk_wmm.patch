@@ -1,0 +1,97 @@
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -81,7 +81,13 @@
+ OBJS_c = wpa_cli.o ../src/common/wpa_ctrl.o
+ OBJS_c += ../src/utils/wpa_debug.o
+ OBJS_c += ../src/utils/common.o
++ifndef CONFIG_NO_WMM_AC
+ OBJS += wmm_ac.o
++endif
++
++ifdef CONFIG_NO_WMM_AC
++CFLAGS += -DCONFIG_NO_WMM_AC
++endif
+ 
+ ifndef CONFIG_OS
+ ifdef CONFIG_NATIVE_WINDOWS
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -439,7 +439,9 @@
+ 	wpa_tdls_deinit(wpa_s->wpa);
+ #endif /* CONFIG_TDLS */
+ 
++#ifndef CONFIG_NO_WMM_AC
+ 	wmm_ac_clear_saved_tspecs(wpa_s);
++#endif /* CONFIG_NO_WMM_AC */
+ 	pmksa_candidate_free(wpa_s->wpa);
+ 	wpa_sm_deinit(wpa_s->wpa);
+ 	wpa_s->wpa = NULL;
+@@ -531,7 +533,9 @@
+ 		wpa_s->vendor_elem[i] = NULL;
+ 	}
+ 
++#ifndef CONFIG_NO_WMM_AC
+ 	wmm_ac_notify_disassoc(wpa_s);
++#endif /* CONFIG_NO_WMM_AC */
+ }
+ 
+ 
+@@ -764,8 +768,10 @@
+ 	if (state == WPA_DISCONNECTED || state == WPA_INACTIVE)
+ 		wpa_supplicant_start_autoscan(wpa_s);
+ 
++#ifndef CONFIG_NO_WMM_AC
+ 	if (old_state >= WPA_ASSOCIATED && wpa_s->wpa_state < WPA_ASSOCIATED)
+ 		wmm_ac_notify_disassoc(wpa_s);
++#endif /* CONFIG_NO_WMM_AC */
+ 
+ 	if (wpa_s->wpa_state != old_state) {
+ 		wpas_notify_state_changed(wpa_s, wpa_s->wpa_state, old_state);
+@@ -1538,13 +1544,17 @@
+ 	else
+ 		rand_style = ssid->mac_addr;
+ 
++#ifndef CONFIG_NO_WMM_AC
+ 	wmm_ac_clear_saved_tspecs(wpa_s);
++#endif /* CONFIG_NO_WMM_AC */
+ 	wpa_s->reassoc_same_bss = 0;
+ 
+ 	if (wpa_s->last_ssid == ssid) {
+ 		wpa_dbg(wpa_s, MSG_DEBUG, "Re-association to the same ESS");
+ 		if (wpa_s->current_bss && wpa_s->current_bss == bss) {
++#ifndef CONFIG_NO_WMM_AC
+ 			wmm_ac_save_tspecs(wpa_s);
++#endif /* CONFIG_NO_WMM_AC */
+ 			wpa_s->reassoc_same_bss = 1;
+ 		}
+ 	} else if (rand_style > 0) {
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -2120,12 +2120,14 @@
+ 	wpas_wps_notify_assoc(wpa_s, bssid);
+ 
+ 	if (data) {
++#ifndef CONFIG_NO_WMM_AC
+ 		wmm_ac_notify_assoc(wpa_s, data->assoc_info.resp_ies,
+ 				    data->assoc_info.resp_ies_len,
+ 				    &data->assoc_info.wmm_params);
+ 
+ 		if (wpa_s->reassoc_same_bss)
+ 			wmm_ac_restore_tspecs(wpa_s);
++#endif /* CONFIG_NO_WMM_AC */
+ 	}
+ }
+ 
+@@ -2888,10 +2890,12 @@
+ 		" Category=%u DataLen=%d freq=%d MHz",
+ 		MAC2STR(mgmt->sa), category, (int) plen, freq);
+ 
++#ifndef CONFIG_NO_WMM_AC
+ 	if (category == WLAN_ACTION_WMM) {
+ 		wmm_ac_rx_action(wpa_s, mgmt->da, mgmt->sa, payload, plen);
+ 		return;
+ 	}
++#endif /* CONFIG_NO_WMM_AC */
+ 
+ #ifdef CONFIG_IEEE80211R
+ 	if (category == WLAN_ACTION_FT) {

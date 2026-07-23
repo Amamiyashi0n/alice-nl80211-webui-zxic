@@ -1,0 +1,23 @@
+diff --git a/wpa_supplicant/config.c b/wpa_supplicant/config.c
+--- a/wpa_supplicant/config.c
++++ b/wpa_supplicant/config.c
+@@ -1810,6 +1810,11 @@
+  * functions.
+  */
+ static const struct parse_data ssid_fields[] = {
++#ifdef WPA_MINI_PSK_ENGINE
++/* WPA_MINI_PSK_FIELDS */
++	{ STR_RANGE(ssid, 0, MAX_SSID_LEN) },
++	{ FUNC_KEY(psk) },
++#else
+ 	{ STR_RANGE(ssid, 0, MAX_SSID_LEN) },
+ 	{ INT_RANGE(scan_ssid, 0, 1) },
+ 	{ FUNC(bssid) },
+@@ -1954,6 +1959,7 @@
+ 	{ INT(update_identifier) },
+ #endif /* CONFIG_HS20 */
+ 	{ INT_RANGE(mac_addr, 0, 2) },
++#endif /* WPA_MINI_PSK_ENGINE */
+ };
+ 
+ #undef OFFSET
