@@ -87,6 +87,7 @@ void dynamic_runtime_init(void);
 #define SYS_LISTEN_MAX 24
 #define SYS_FS_MAX 8
 #define RELAY_IFACES_TEXT_MAX 128
+#define HARDWARE_REASON_MAX 192
 #define DIAG_TIMEOUT_MS 1800
 #define USER_NAT_MAX 128
 #define USER_NAT_TTL_MS 180000
@@ -125,6 +126,10 @@ static char signal_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 static char engine_log_path[PATH_MAX] = DEFAULT_LOG_PATH;
 static volatile sig_atomic_t webui_restart_requested;
 static int webui_restart_port;
+static int hardware_probe_done;
+static int hardware_probe_supported = -1;
+static char hardware_probe_iface[IFNAMSIZ];
+static char hardware_probe_reason[HARDWARE_REASON_MAX];
 
 struct runtime_status;
 
@@ -198,6 +203,8 @@ struct runtime_status {
 	int relay_nat_rule;
 	int relay_dhcp_running;
 	int relay_user_nat_running;
+	int hardware_supported;
+	char hardware_reason[HARDWARE_REASON_MAX];
 };
 
 struct saved_wifi {
@@ -5864,6 +5871,10 @@ static void get_runtime_status(const struct app_config *cfg,
 	size_t len;
 
 	memset(st, 0, sizeof(*st));
+	st->hardware_supported = hardware_probe_done ?
+		hardware_probe_supported : -1;
+	snprintf(st->hardware_reason, sizeof(st->hardware_reason), "%s",
+		hardware_probe_done ? hardware_probe_reason : "硬件能力尚未检测。");
 	if (read_pid(cfg->pidfile, &st->engine_pid) == 0)
 		st->engine_running = process_running(st->engine_pid);
 	if (read_pid(cfg->dhcp_pidfile, &st->dhcp_pid) == 0)
@@ -6007,6 +6018,11 @@ static int run_scan(const struct app_config *cfg, char *out, size_t outsz)
 	log_msg(cfg, "scan requested");
 	if (outsz)
 		out[0] = '\0';
+	if (hardware_probe_done && hardware_probe_supported == 0) {
+		log_msg(cfg, "scan rejected: hardware probe unsupported reason=%s",
+			hardware_probe_reason);
+		return -1;
+	}
 	out_cap = outsz;
 	reply = calloc(1, CTRL_REPLY_MAX);
 	if (!reply) {
@@ -6048,6 +6064,91 @@ static int run_scan(const struct app_config *cfg, char *out, size_t outsz)
 out:
 	free(reply);
 	return ret;
+}
+
+static void set_hardware_probe(const struct app_config *cfg, int supported,
+			       const char *reason)
+{
+	hardware_probe_done = 1;
+	hardware_probe_supported = supported ? 1 : 0;
+	snprintf(hardware_probe_iface, sizeof(hardware_probe_iface), "%s",
+		 cfg->iface);
+	snprintf(hardware_probe_reason, sizeof(hardware_probe_reason), "%s",
+		 reason ? reason : "");
+	log_msg(cfg, "hardware probe result=%s iface=%s reason=%s",
+		supported ? "supported" : "unsupported", cfg->iface,
+		hardware_probe_reason);
+}
+
+static int hardware_iface_exists(const char *iface)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	int len;
+
+	if (!iface || !*iface)
+		return 0;
+	len = snprintf(path, sizeof(path), "/sys/class/net/%s", iface);
+	if (len < 0 || (size_t)len >= sizeof(path))
+		return 0;
+	return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int hardware_has_phy(void)
+{
+	DIR *dir;
+	struct dirent *entry;
+	int found = 0;
+
+	dir = opendir("/sys/class/ieee80211");
+	if (!dir)
+		return 0;
+	while ((entry = readdir(dir)) != NULL) {
+		if (strncmp(entry->d_name, "phy", 3) == 0) {
+			found = 1;
+			break;
+		}
+	}
+	closedir(dir);
+	return found;
+}
+
+static void probe_hardware(const struct app_config *cfg)
+{
+	char reason[HARDWARE_REASON_MAX];
+	char scan[4096];
+	pid_t pid;
+	int had_engine;
+
+	if (hardware_probe_done &&
+	    strcmp(hardware_probe_iface, cfg->iface) == 0)
+		return;
+
+	if (!hardware_iface_exists(cfg->iface)) {
+		snprintf(reason, sizeof(reason),
+			 "硬件不支持：STA 接口 %s 不存在。",
+			 cfg->iface);
+		set_hardware_probe(cfg, 0, reason);
+		return;
+	}
+	if (!hardware_has_phy()) {
+		snprintf(reason, sizeof(reason),
+			 "硬件不支持：内核未注册可用的 nl80211 无线 PHY。");
+		set_hardware_probe(cfg, 0, reason);
+		return;
+	}
+
+	had_engine = read_pid(cfg->pidfile, &pid) == 0 &&
+		process_running(pid) && ctrl_ping(cfg) == 0;
+	if (run_scan(cfg, scan, sizeof(scan)) == 0) {
+		set_hardware_probe(cfg, 1,
+				   "已通过 nl80211 实际扫描检测。");
+		return;
+	}
+	if (!had_engine)
+		stop_engine(cfg);
+	set_hardware_probe(cfg, 0,
+				   "硬件不支持：接口未提供可用的 nl80211 STA/扫描能力。");
 }
 
 static int connect_wifi_internal(const struct app_config *cfg,
@@ -6861,6 +6962,7 @@ static void append_page_start(char *body, size_t bodysz,
 {
 	char esc_title[128], esc_subtitle[256], esc_msg[512];
 	char esc_iface[128], esc_state[128], esc_ssid[256], esc_ip[128];
+	char esc_hardware[768];
 	const char *state_color;
 	const char *state_label;
 
@@ -6871,10 +6973,16 @@ static void append_page_start(char *body, size_t bodysz,
 	html_escape(esc_state, sizeof(esc_state), st->wpa_state);
 	html_escape(esc_ssid, sizeof(esc_ssid), st->ssid);
 	html_escape(esc_ip, sizeof(esc_ip), st->ip);
-	state_color = strcmp(st->wpa_state, "COMPLETED") == 0 ? "#2f7d4f" :
-		      st->engine_running ? "#936b20" : "#9b4444";
-	state_label = strcmp(st->wpa_state, "COMPLETED") == 0 ? "已连接" :
-		      st->engine_running ? "连接中" : "已停止";
+	html_escape(esc_hardware, sizeof(esc_hardware), st->hardware_reason);
+	if (st->hardware_supported == 0) {
+		state_color = "#b3261e";
+		state_label = "硬件不支持";
+	} else {
+		state_color = strcmp(st->wpa_state, "COMPLETED") == 0 ? "#2f7d4f" :
+			      st->engine_running ? "#936b20" : "#9b4444";
+		state_label = strcmp(st->wpa_state, "COMPLETED") == 0 ? "已连接" :
+			      st->engine_running ? "连接中" : "已停止";
+	}
 
 	buf_append(body, bodysz,
 		   "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -6892,7 +7000,7 @@ static void append_page_start(char *body, size_t bodysz,
 		   ".nav{display:flex;flex-direction:column;gap:6px}.nav a{border-radius:8px;padding:10px 11px;color:#405246;font-size:14px;font-weight:700;transition:background .15s,color .15s,transform .15s}.nav a:hover{background:#eef7ef;transform:translateX(2px)}.nav a.active{background:#dcefe2;color:#1e5e3a}"
 		   ".sidecard{margin-top:auto;border:1px solid #dbe8dc;border-radius:8px;background:#fff;padding:12px}.pill{display:inline-block;border-radius:999px;padding:6px 10px;background:%s;color:#fff;font-size:13px;font-weight:800;white-space:nowrap}"
 		   "main.page{min-width:0;max-width:1160px;width:100%%;margin:0 auto;padding:22px 22px 30px}.topline{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:16px}.h1{font-size:25px;font-weight:800;letter-spacing:0}.topmeta{text-align:right;min-width:128px}"
-		   ".msg{background:#eef8f0;border:1px solid #c9dfd0;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.9fr);gap:14px}"
+		   ".msg{background:#eef8f0;border:1px solid #c9dfd0;border-radius:8px;color:#235a39;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.hardware-error{background:#fff1f1;border:1px solid #e0a7a7;border-radius:8px;color:#a32626;padding:12px 14px;margin-bottom:14px;animation:rise .18s ease-out}.hardware-error strong{display:block;margin-bottom:4px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.9fr);gap:14px}"
 		   ".panel{background:#fff;border:1px solid #d9e5dc;border-radius:8px;margin-bottom:14px;box-shadow:0 5px 16px rgba(24,37,29,.045);overflow:hidden;animation:rise .22s ease-out}.panel.hot{animation:pulse .7s ease-out}.formtop{border-bottom:1px solid #e7eee8;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px}.title{font-size:16px;font-weight:800}.pad{padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.wide{grid-column:1/-1}"
 		   ".kv{border-bottom:1px solid #edf2ee;padding:8px 0}.summary .kv{background:#fff;border:1px solid #d9e5dc;border-radius:8px;padding:11px 13px}.k{font-size:12px;color:#6d7b71}.v{font-size:14px;font-weight:800;word-break:break-all;margin-top:3px}.smallv{font-size:12px;font-weight:700;line-height:1.45}"
 		   ".twocol{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:13px;font-weight:800;margin:11px 0 5px}"
@@ -6918,6 +7026,10 @@ static void append_page_start(char *body, size_t bodysz,
 	if (message && *message)
 		buf_append(body, bodysz, "<section class=\"msg\">%s</section>",
 			   esc_msg);
+	if (st->hardware_supported == 0)
+		buf_append(body, bodysz,
+			   "<section class=\"hardware-error\"><strong>硬件不支持</strong><span>%s</span></section>",
+			   esc_hardware[0] ? esc_hardware : "当前设备不支持此 STA/nl80211 功能。");
 }
 
 static void append_page_end(char *body, size_t bodysz)
@@ -7045,6 +7157,7 @@ static void append_home_content(char *body, size_t bodysz,
 		   "<div class=\"kv\"><div class=\"k\">DNS</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">引擎 PID</div><div class=\"v\">%ld</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">DHCP PID</div><div class=\"v\">%ld</div></div>"
+		   "<div class=\"kv\"><div class=\"k\">硬件能力</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">中继/NAT</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">下层网络</div><div class=\"v\">%s %s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">热点/USB 接口</div><div class=\"v\">%s</div></div>"
@@ -7056,6 +7169,8 @@ static void append_home_content(char *body, size_t bodysz,
 		   esc_dns[0] ? esc_dns : "-",
 		   st->engine_running ? (long)st->engine_pid : 0L,
 		   st->dhcp_running ? (long)st->dhcp_pid : 0L,
+		   st->hardware_supported > 0 ? "已支持" :
+		   st->hardware_supported == 0 ? "硬件不支持" : "未检测",
 		   st->relay_enabled ? "已启用" : "未启用",
 		   esc_relay_lan, esc_relay_subnet,
 		   esc_relay_members,
@@ -7241,6 +7356,7 @@ static void render_status(int fd, const struct app_config *cfg)
 	char esc_dns_path[512], esc_relay_lan[128], esc_relay_subnet[128];
 	char esc_relay_wan[128], esc_sta_subnet[128], esc_lan_subnet[128];
 	char esc_relay_members[256];
+	char esc_hardware[768];
 	char body[4096];
 
 	log_msg(cfg, "render status");
@@ -7262,6 +7378,7 @@ static void render_status(int fd, const struct app_config *cfg)
 	json_escape(esc_relay_wan, sizeof(esc_relay_wan), st.relay_wan_iface);
 	json_escape(esc_sta_subnet, sizeof(esc_sta_subnet), st.sta_subnet);
 	json_escape(esc_lan_subnet, sizeof(esc_lan_subnet), st.lan_subnet);
+	json_escape(esc_hardware, sizeof(esc_hardware), st.hardware_reason);
 
 	snprintf(body, sizeof(body),
 		 "{\"engine_running\":%s,\"engine_pid\":%ld,"
@@ -7269,6 +7386,8 @@ static void render_status(int fd, const struct app_config *cfg)
 		 "\"iface\":\"%s\",\"wpa_state\":\"%s\",\"ssid\":\"%s\","
 		 "\"bssid\":\"%s\",\"key_mgmt\":\"%s\",\"ip\":\"%s\","
 		 "\"gateway\":\"%s\",\"dns\":\"%s\",\"dns_path\":\"%s\","
+		 "\"hardware_supported\":%d,\"hardware_state\":\"%s\","
+		 "\"hardware_reason\":\"%s\","
 		 "\"sta_subnet\":\"%s\",\"lan_subnet\":\"%s\","
 		 "\"default_route_ready\":%s,\"sta_lan_conflict\":%s,"
 		 "\"relay_enabled\":%s,\"relay_lan_iface\":\"%s\","
@@ -7283,6 +7402,10 @@ static void render_status(int fd, const struct app_config *cfg)
 		 st.dhcp_running ? (long)st.dhcp_pid : 0L,
 		 esc_iface, esc_state, esc_ssid, esc_bssid, esc_key,
 		 esc_ip, esc_gw, esc_dns, esc_dns_path,
+		 st.hardware_supported,
+		 st.hardware_supported > 0 ? "supported" :
+		 st.hardware_supported == 0 ? "unsupported" : "unknown",
+		 esc_hardware,
 		 esc_sta_subnet, esc_lan_subnet,
 		 st.default_route_ready ? "true" : "false",
 		 st.sta_lan_conflict ? "true" : "false",
@@ -7379,6 +7502,11 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 	char use_dns1[64];
 	char use_dns2[64];
 
+	if (hardware_probe_supported == 0) {
+		render_page(fd, cfg, hardware_probe_reason, NULL);
+		return;
+	}
+
 	snprintf(use_dns1, sizeof(use_dns1), "%s",
 		 dns1 && dns1[0] ? dns1 : DEFAULT_DNS1);
 	snprintf(use_dns2, sizeof(use_dns2), "%s",
@@ -7405,7 +7533,9 @@ static void connect_wifi_request(int fd, const struct app_config *cfg,
 	deconfigure_iface(cfg);
 
 	if (start_engine_process(cfg) < 0) {
-		render_page(fd, cfg, "配置已写入，但内置 WPA 引擎启动失败。", NULL);
+		render_page(fd, cfg,
+			 hardware_probe_supported == 0 ? hardware_probe_reason :
+			 "配置已写入，但内置 WPA 引擎启动失败。", NULL);
 		return;
 	}
 
@@ -7552,7 +7682,9 @@ static void handle_scan_page(int fd, const struct app_config *cfg)
 	}
 	if (run_scan(cfg, scan, SCAN_TEXT_MAX) < 0) {
 		free(scan);
-		render_page(fd, cfg, "扫描失败，请检查接口和内置引擎状态。", NULL);
+		render_page(fd, cfg,
+			 hardware_probe_supported == 0 ? hardware_probe_reason :
+			 "扫描失败，请检查接口和内置引擎状态。", NULL);
 		return;
 	}
 	render_page(fd, cfg, NULL, scan);
@@ -7571,7 +7703,9 @@ static void handle_scan_text(int fd, const struct app_config *cfg)
 	}
 	if (run_scan(cfg, scan, SCAN_TEXT_MAX) < 0) {
 		free(scan);
-		http_send(fd, cfg, 500, "Scan Failed", "text/plain", "scan failed\n");
+		http_send(fd, cfg, 500, "Scan Failed", "text/plain",
+			  hardware_probe_supported == 0 ? hardware_probe_reason :
+			  "scan failed\n");
 		return;
 	}
 	http_send(fd, cfg, 200, "OK", "text/plain; charset=utf-8", scan);
@@ -7627,6 +7761,10 @@ static void handle_relay_on(int fd, const struct app_config *cfg)
 	int auto_lan;
 
 	get_runtime_status(cfg, &st);
+	if (hardware_probe_supported == 0) {
+		render_page(fd, cfg, hardware_probe_reason, NULL);
+		return;
+	}
 	if (!runtime_is_connected(&st)) {
 		render_page(fd, cfg, "请先连接 WiFi，获取 IP 后才能共享网络。", NULL);
 		return;
@@ -7946,6 +8084,8 @@ static int run_webui(const struct app_config *cfg)
 	int s;
 	int opt = 1;
 	struct sockaddr_in addr;
+
+	probe_hardware(cfg);
 
 	s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s < 0) {
