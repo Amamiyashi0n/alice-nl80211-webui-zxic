@@ -56,7 +56,6 @@ void dynamic_runtime_init(void);
 #define DEFAULT_UDHCPD_CONF "/etc_rw/udhcpd.conf"
 #define DEFAULT_UDHCPD_LEASES "/etc_rw/udhcpd.leases"
 #define DEFAULT_RUN_PATH "/mnt/userdata/wpa_mini.run"
-#define DEFAULT_BIN_PATH "/mnt/userdata/wpa_mini"
 #define DEFAULT_AUTOSTART_SCRIPT "/mnt/userdata/wpa_mini_autostart.sh"
 #define DEFAULT_AUTOSTART_RC "/etc/rc"
 #define DEFAULT_ADMIN_HOSTNAME "zxic-admin-webui"
@@ -67,8 +66,9 @@ void dynamic_runtime_init(void);
 #define DEFAULT_DNS1 "223.5.5.5"
 #define DEFAULT_DNS2 "119.29.29.29"
 #define DEFAULT_LOG_PATH "/tmp/wpa_mini.log"
-#define DEFAULT_PORT 51400
+#define DEFAULT_PORT 51401
 #define DEFAULT_UDHCPC "/sbin/udhcpc"
+#define AUTOSTART_RESERVE_BYTES (16UL * 1024UL)
 
 #define HTTP_REQ_MAX 8192
 #define HTTP_BODY_MAX 4096
@@ -224,9 +224,12 @@ struct saved_wifi {
 
 struct autostart_status {
 	int run_ready;
-	int bin_ready;
+	int source_ready;
+	int userdata_space_ok;
 	int script_ready;
 	int hook_ready;
+	unsigned long free_bytes;
+	unsigned long required_bytes;
 };
 
 struct sys_iface {
@@ -348,12 +351,12 @@ static void usage(int fd)
 {
 	static const char text[] =
 		"Usage:\n"
-		"  wpa_mini [options]                 start WebUI on port 51400\n"
+		"  wpa_mini [options]                 start WebUI on port 51401\n"
 		"  wpa_mini -i IFACE -s SSID -p PSK   connect once with internal engine\n"
 		"\n"
 		"Options:\n"
 		"  -w         force WebUI mode\n"
-		"  -L PORT    WebUI listen port; default is 51400\n"
+		"  -L PORT    WebUI listen port; default is 51401\n"
 		"  -i IFACE   wireless interface; default is wlan0-vxd\n"
 		"  -s SSID    WPA/WPA2-PSK SSID for one-shot mode\n"
 		"  -p PSK     passphrase (8-63 bytes) or 64-hex PSK\n"
@@ -2472,6 +2475,75 @@ static int path_is_regular_readable(const char *path)
 	return access(path, R_OK) == 0;
 }
 
+static int file_size_bytes(const char *path, unsigned long *out)
+{
+	struct stat st;
+	unsigned long long size;
+
+	if (!out || stat(path, &st) < 0)
+		return -1;
+	if (!S_ISREG(st.st_mode) || st.st_size < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	size = (unsigned long long)st.st_size;
+	*out = size > ULONG_MAX ? ULONG_MAX : (unsigned long)size;
+	return 0;
+}
+
+static int userdata_free_bytes(unsigned long *out)
+{
+	struct statvfs sv;
+	unsigned long long bytes;
+
+	if (!out) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (statvfs("/mnt/userdata", &sv) < 0)
+		return -1;
+	if (!sv.f_frsize) {
+		errno = EIO;
+		return -1;
+	}
+	bytes = (unsigned long long)sv.f_bavail *
+		(unsigned long long)sv.f_frsize;
+	*out = bytes > ULONG_MAX ? ULONG_MAX : (unsigned long)bytes;
+	return 0;
+}
+
+static int autostart_space_sufficient(const char *source,
+					      unsigned long *free_out,
+					      unsigned long *required_out)
+{
+	unsigned long source_size;
+	unsigned long existing_size = 0;
+	unsigned long free_bytes;
+	unsigned long required;
+
+	if (file_size_bytes(source, &source_size) < 0)
+		return -1;
+	if (source_size > ULONG_MAX - AUTOSTART_RESERVE_BYTES) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	required = source_size + AUTOSTART_RESERVE_BYTES;
+	if (file_size_bytes(DEFAULT_RUN_PATH, &existing_size) < 0 &&
+		errno != ENOENT)
+		return -1;
+	if (userdata_free_bytes(&free_bytes) < 0)
+		return -1;
+	if (free_out)
+		*free_out = free_bytes;
+	if (required_out)
+		*required_out = required;
+	if (free_bytes < required && existing_size < required - free_bytes) {
+		errno = ENOSPC;
+		return -1;
+	}
+	return 0;
+}
+
 static int path_is_same_file(const char *a, const char *b)
 {
 	struct stat sa;
@@ -2573,9 +2645,18 @@ out:
 
 static void get_autostart_status(struct autostart_status *st)
 {
+	const char *run_src;
+
 	memset(st, 0, sizeof(*st));
-	st->run_ready = access(DEFAULT_RUN_PATH, R_OK) == 0;
-	st->bin_ready = access(DEFAULT_BIN_PATH, X_OK) == 0;
+	st->run_ready = path_is_regular_readable(DEFAULT_RUN_PATH);
+	run_src = getenv("WPA_MINI_RUN_SOURCE");
+	st->source_ready = path_is_regular_readable(run_src);
+	st->userdata_space_ok = 1;
+	if (st->source_ready &&
+	    autostart_space_sufficient(run_src, &st->free_bytes,
+					&st->required_bytes) < 0 &&
+	    errno == ENOSPC)
+		st->userdata_space_ok = 0;
 	st->script_ready = access(DEFAULT_AUTOSTART_SCRIPT, R_OK) == 0;
 	st->hook_ready = file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_BEGIN) &&
 			 file_contains(DEFAULT_AUTOSTART_RC, AUTOSTART_END);
@@ -2587,49 +2668,38 @@ static void remount_userdata_rw(void)
 	       "mount -o remount,rw /mnt/userdata 2>/dev/null");
 }
 
-static int install_autostart_payload(const struct app_config *cfg,
-				     int *payload_kind)
+static int install_autostart_payload(const struct app_config *cfg)
 {
 	const char *run_src;
-	char exe[PATH_MAX];
-	int run_errno = 0;
-
-	if (payload_kind)
-		*payload_kind = 0;
-	remount_userdata_rw();
 
 	run_src = getenv("WPA_MINI_RUN_SOURCE");
-	if (path_is_regular_readable(run_src)) {
-		if (copy_regular_file(run_src, DEFAULT_RUN_PATH, 0755) == 0) {
-			log_msg(cfg, "autostart payload copied run source=%s dst=%s",
-				run_src, DEFAULT_RUN_PATH);
-			if (payload_kind)
-				*payload_kind = 1;
-			sync();
-			return 0;
-		}
-		run_errno = errno;
-		log_msg(cfg, "autostart run payload copy failed source=%s errno=%d",
+	if (!run_src || !*run_src) {
+		errno = ENOENT;
+		log_msg(cfg, "autostart requires a .run source");
+		return -1;
+	}
+	if (!path_is_regular_readable(run_src)) {
+		log_msg(cfg, "autostart .run source is not readable source=%s errno=%d",
 			run_src, errno);
+		return -1;
 	}
-
-	if (current_exe_path(exe, sizeof(exe)) == 0 &&
-	    path_is_regular_readable(exe)) {
-		if (copy_regular_file(exe, DEFAULT_BIN_PATH, 0755) == 0) {
-			log_msg(cfg, "autostart payload copied binary source=%s dst=%s",
-				exe, DEFAULT_BIN_PATH);
-			if (payload_kind)
-				*payload_kind = 2;
-			sync();
-			return 0;
-		}
-		log_msg(cfg, "autostart binary payload copy failed source=%s errno=%d",
-			exe, errno);
+	remount_userdata_rw();
+	if (autostart_space_sufficient(run_src, NULL, NULL) < 0) {
+		log_msg(cfg, "autostart .run payload space check failed source=%s errno=%d",
+			run_src, errno);
+		return -1;
 	}
-
-	if (run_errno)
-		errno = run_errno;
-	return -1;
+	if (copy_regular_file(run_src, DEFAULT_RUN_PATH, 0755) < 0) {
+		log_msg(cfg, "autostart .run payload copy failed source=%s errno=%d",
+			run_src, errno);
+		return -1;
+	}
+	if (unlink("/mnt/userdata/wpa_mini") < 0 && errno != ENOENT)
+		log_msg(cfg, "legacy binary cleanup failed errno=%d", errno);
+	log_msg(cfg, "autostart .run payload copied source=%s dst=%s",
+		run_src, DEFAULT_RUN_PATH);
+	sync();
+	return 0;
 }
 
 static void write_autostart_args(FILE *fp, const struct app_config *cfg)
@@ -2652,15 +2722,11 @@ static void write_autostart_args(FILE *fp, const struct app_config *cfg)
 	shell_quote(fp, cfg->udhcpc);
 }
 
-static void write_autostart_exec_block(FILE *fp, const char *var,
-				       int use_shell,
-				       const struct app_config *cfg)
+static void write_autostart_run_block(FILE *fp,
+					      const struct app_config *cfg)
 {
-	fprintf(fp, "if [ %s \"$%s\" ]; then\n", use_shell ? "-r" : "-x", var);
-	fprintf(fp, "\texec ");
-	if (use_shell)
-		fprintf(fp, "/bin/sh ");
-	fprintf(fp, "\"$%s\"", var);
+	fprintf(fp, "if [ -r \"$RUN\" ]; then\n");
+	fprintf(fp, "\texec /bin/sh \"$RUN\"");
 	write_autostart_args(fp, cfg);
 	fprintf(fp, "\nfi\n");
 }
@@ -2668,10 +2734,9 @@ static void write_autostart_exec_block(FILE *fp, const char *var,
 static int write_autostart_script(const struct app_config *cfg)
 {
 	int fd;
-	int payload_kind = 0;
 	FILE *fp;
 
-	if (install_autostart_payload(cfg, &payload_kind) < 0)
+	if (install_autostart_payload(cfg) < 0)
 		return -1;
 	if (mkdir_parent(DEFAULT_AUTOSTART_SCRIPT) < 0)
 		return -1;
@@ -2693,16 +2758,8 @@ static int write_autostart_script(const struct app_config *cfg)
 	fprintf(fp, "mount -o remount,rw,exec /mnt/userdata 2>/dev/null || mount -o remount,rw /mnt/userdata 2>/dev/null || true\n");
 	fprintf(fp, "RUN=");
 	shell_quote(fp, DEFAULT_RUN_PATH);
-	fprintf(fp, "\nBIN=");
-	shell_quote(fp, DEFAULT_BIN_PATH);
 	fprintf(fp, "\n");
-	if (payload_kind == 2) {
-		write_autostart_exec_block(fp, "BIN", 0, cfg);
-		write_autostart_exec_block(fp, "RUN", 1, cfg);
-	} else {
-		write_autostart_exec_block(fp, "RUN", 1, cfg);
-		write_autostart_exec_block(fp, "BIN", 0, cfg);
-	}
+	write_autostart_run_block(fp, cfg);
 	fprintf(fp, "echo \"missing wpa_mini startup payload\" >&2\n");
 	fprintf(fp, "exit 127\n");
 
@@ -2834,6 +2891,8 @@ static int disable_autostart(int *hook_remove_failed)
 		*hook_remove_failed = 0;
 	remount_userdata_rw();
 	if (unlink(DEFAULT_AUTOSTART_SCRIPT) < 0 && errno != ENOENT)
+		rc = -1;
+	if (unlink("/mnt/userdata/wpa_mini") < 0 && errno != ENOENT)
 		rc = -1;
 	if (remove_autostart_hook() < 0) {
 		rc = -1;
@@ -6687,7 +6746,7 @@ static void restart_webui_process(const struct app_config *cfg, int port)
 	if (pid == 0) {
 		char port_arg[16];
 		const char *self = cfg->self_path[0] ? cfg->self_path :
-				   DEFAULT_BIN_PATH;
+				   DEFAULT_RUN_PATH;
 
 		snprintf(port_arg, sizeof(port_arg), "%d", port);
 		usleep(200000);
@@ -6826,35 +6885,48 @@ static void build_autostart_html(char *out, size_t outsz)
 	const char *label;
 	const char *detail;
 	const char *payload;
+	char detail_buf[256];
 
 	if (outsz)
 		out[0] = '\0';
+	detail_buf[0] = '\0';
 
 	get_autostart_status(&st);
-	if (st.run_ready && st.bin_ready)
-		payload = ".run 与二进制已就绪";
-	else if (st.run_ready)
+	if (st.run_ready)
 		payload = ".run 已就绪";
-	else if (st.bin_ready)
-		payload = "二进制已就绪";
 	else
 		payload = "待安装";
 
-	if ((st.run_ready || st.bin_ready) && st.script_ready && st.hook_ready) {
+	if (!st.userdata_space_ok) {
+		label = "设备不支持";
+		if (st.required_bytes && st.free_bytes) {
+			snprintf(detail_buf, sizeof(detail_buf),
+				 "mnt/userdata 空间不足：需要约 %lu KB，可用约 %lu KB。",
+				 (st.required_bytes + 1023UL) / 1024UL,
+				 (st.free_bytes + 1023UL) / 1024UL);
+		} else {
+			snprintf(detail_buf, sizeof(detail_buf),
+				 "mnt/userdata 空间不足，无法保存 .run 启动包。");
+		}
+		detail = detail_buf;
+	} else if (st.run_ready && st.script_ready && st.hook_ready) {
 		label = "已启用";
 		detail = "开机会从 /mnt/userdata 启动 WebUI";
 	} else if (st.script_ready || st.hook_ready) {
 		label = "部分启用";
 		detail = "启动脚本或系统钩子不完整，可重新启用修复";
+	} else if (!st.source_ready) {
+		label = "未启用";
+		detail = "请从 .run 启动包运行 WebUI 后再启用自启动";
 	} else {
 		label = "未启用";
-		detail = "点击启用时会自动复制当前启动文件";
+		detail = "点击启用时会复制当前 .run 启动包";
 	}
 
 	buf_append(out, outsz,
-		   "<section class=\"panel\"><div class=\"formtop\"><div>"
-		   "<div class=\"title\">开机自启动</div>"
-		   "<div class=\"hint\">持久路径：" DEFAULT_RUN_PATH " / " DEFAULT_BIN_PATH "</div>"
+		"<section class=\"panel\"><div class=\"formtop\"><div>"
+		"<div class=\"title\">开机自启动</div>"
+		"<div class=\"hint\">持久路径：" DEFAULT_RUN_PATH "</div>"
 		   "</div></div><div class=\"pad\"><div class=\"grid\">"
 		   "<div class=\"kv\"><div class=\"k\">状态</div><div class=\"v\">%s</div></div>"
 		   "<div class=\"kv\"><div class=\"k\">说明</div><div class=\"v\">%s</div></div>"
@@ -8073,11 +8145,23 @@ static void handle_scan_text(int fd, const struct app_config *cfg)
 
 static void handle_autostart_on(int fd, const struct app_config *cfg)
 {
+	int saved_errno;
+
 	if (write_autostart_script(cfg) < 0) {
+		saved_errno = errno;
 		log_msg(cfg, "autostart script write failed errno=%d", errno);
-		render_page(fd, cfg,
-			    "自启动安装失败，请确认 /mnt/userdata 可写，并且当前启动文件仍可读取。",
-			    NULL);
+		if (saved_errno == ENOSPC)
+			render_page(fd, cfg,
+				    "设备不支持：/mnt/userdata 空间不足，无法保存 .run 启动包。",
+				    NULL);
+		else if (saved_errno == ENOENT)
+			render_page(fd, cfg,
+				    "自启动安装失败：当前不是从 .run 启动包运行，请先使用 .run 启动包启动 WebUI。",
+				    NULL);
+		else
+			render_page(fd, cfg,
+				    "自启动安装失败，请确认 /mnt/userdata 可写，并且 .run 启动包仍可读取。",
+				    NULL);
 		return;
 	}
 
@@ -8619,7 +8703,7 @@ int main(int argc, char **argv)
 	cfg.self_path[0] = '\0';
 	if (current_exe_path(cfg.self_path, sizeof(cfg.self_path)) < 0)
 		snprintf(cfg.self_path, sizeof(cfg.self_path), "%s",
-			 argv[0] ? argv[0] : DEFAULT_BIN_PATH);
+			 argv[0] ? argv[0] : DEFAULT_RUN_PATH);
 
 	while ((opt = getopt(argc, argv, "wi:s:p:c:C:D:P:L:r:l:u:HMNFnh")) != -1) {
 		switch (opt) {

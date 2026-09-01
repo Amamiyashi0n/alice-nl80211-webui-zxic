@@ -8,7 +8,7 @@
 - `wpa_mini.run`: 自解压启动包，适合放在 `/mnt/userdata` 持久分区。
 - `README.md`: 本说明文件。
 
-当前生成的 `wpa_mini` 大小为 `285496` 字节，`wpa_mini.run` 大小为 `162701` 字节。`wpa_mini` 是单一可执行文件，已经把纯 WPA2-PSK STA 连接引擎、WebUI 头像和赞助二维码资源链接进程序内部，不需要额外交付 `wpa_cli`、外部 `wpa_supplicant` 或图片文件。动态依赖由目标设备提供：`ld-uClibc.so.0`、uClibc、libnl-3、libnl-genl-3、libpthread、libm、librt、libdl 和 `libgcc_s`。
+当前生成的 `wpa_mini` 大小为 `293692` 字节，`wpa_mini.run` 大小为 `164493` 字节。`wpa_mini` 是单一可执行文件，已经把纯 WPA2-PSK STA 连接引擎、WebUI 头像和赞助二维码资源链接进程序内部，不需要额外交付 `wpa_cli`、外部 `wpa_supplicant` 或图片文件。动态依赖由目标设备提供：`ld-uClibc.so.0`、uClibc、libnl-3、libnl-genl-3、libpthread、libm、librt、libdl 和 `libgcc_s`。
 
 ## WPA2-PSK 子集
 
@@ -41,13 +41,13 @@
 默认 WebUI 监听：
 
 ```sh
-0.0.0.0:51400
+0.0.0.0:51401
 ```
 
 浏览器访问：
 
 ```text
-http://<设备IP>:51400/
+http://<设备IP>:51401/
 ```
 
 ## 目标设备运行
@@ -78,7 +78,7 @@ chmod +x /mnt/userdata/wpa_mini.run
 指定端口：
 
 ```sh
-/tmp/wpa_mini -w -i wlan0-vxd -L 51400
+/tmp/wpa_mini -w -i wlan0-vxd -L 51401
 ```
 
 指定 DNS 文件路径：
@@ -97,7 +97,7 @@ chmod +x /mnt/userdata/wpa_mini.run
 
 | 参数 | 默认值 |
 | --- | --- |
-| WebUI 端口 | `51400` |
+| WebUI 端口 | `51401` |
 | 无线接口 | `wlan0-vxd` |
 | WPA 配置文件 | `/tmp/wpa_mini.conf` |
 | ctrl_interface | `/tmp/wpa_mini_ctrl` |
@@ -114,7 +114,6 @@ chmod +x /mnt/userdata/wpa_mini.run
 | 日志文件 | `/tmp/wpa_mini.log` |
 | driver | `nl80211` |
 | 持久启动包 | `/mnt/userdata/wpa_mini.run` |
-| 持久二进制 | `/mnt/userdata/wpa_mini` |
 | 自启动脚本 | `/mnt/userdata/wpa_mini_autostart.sh` |
 | 系统启动钩子 | `/etc/rc` |
 
@@ -129,7 +128,7 @@ chmod +x /mnt/userdata/wpa_mini.run
 2. 打开页面：
 
 ```text
-http://<设备IP>:51400/
+http://<设备IP>:51401/
 ```
 
 3. 在 `控制台` 页面点击 `扫描 WiFi` 扫描附近热点。
@@ -152,37 +151,37 @@ http://<设备IP>:51400/
 查看状态：
 
 ```sh
-curl http://127.0.0.1:51400/status
+curl http://127.0.0.1:51401/status
 ```
 
 查看只读系统快照：
 
 ```sh
-curl http://127.0.0.1:51400/system
+curl http://127.0.0.1:51401/system
 ```
 
 查看 HTML 网络接口页面：
 
 ```sh
-curl http://127.0.0.1:51400/interfaces
+curl http://127.0.0.1:51401/interfaces
 ```
 
 查看 HTML 系统信息页面：
 
 ```sh
-curl http://127.0.0.1:51400/system_page
+curl http://127.0.0.1:51401/system_page
 ```
 
 从目标设备自身发起默认网络诊断：
 
 ```sh
-curl http://127.0.0.1:51400/diag
+curl http://127.0.0.1:51401/diag
 ```
 
 探测指定 IPv4：
 
 ```sh
-curl 'http://127.0.0.1:51400/ping?host=223.5.5.5'
+curl 'http://127.0.0.1:51401/ping?host=223.5.5.5'
 ```
 
 目标系统可能会限制普通内核 ICMP/UDP socket，诊断输出中如果看到 `sendto failed errno=1`，优先查看同一目标的 `icmp-l2` 结果；`icmp-l2` 是 `wpa_mini` 自己构造 raw packet 的链路层 ping fallback。
@@ -190,7 +189,7 @@ curl 'http://127.0.0.1:51400/ping?host=223.5.5.5'
 扫描 WiFi：
 
 ```sh
-curl http://127.0.0.1:51400/scan
+curl http://127.0.0.1:51401/scan
 ```
 
 连接 WiFi：
@@ -198,7 +197,7 @@ curl http://127.0.0.1:51400/scan
 ```sh
 curl -X POST \
   -d 'ssid=MyWiFi&psk=password123&dns1=223.5.5.5&dns2=119.29.29.29' \
-  http://127.0.0.1:51400/connect
+  http://127.0.0.1:51401/connect
 ```
 
 连接隐藏 SSID：
@@ -206,7 +205,7 @@ curl -X POST \
 ```sh
 curl -X POST \
   -d 'ssid=MyWiFi&psk=password123&hidden=1' \
-  http://127.0.0.1:51400/connect
+  http://127.0.0.1:51401/connect
 ```
 
 连接并共享网络给热点和 USB 设备：
@@ -214,26 +213,26 @@ curl -X POST \
 ```sh
 curl -X POST \
   -d 'ssid=MyWiFi&psk=password123&relay=1' \
-  http://127.0.0.1:51400/connect
+  http://127.0.0.1:51401/connect
 ```
 
 已连接后开启或关闭共享网络：
 
 ```sh
-curl -X POST http://127.0.0.1:51400/relay_on
-curl -X POST http://127.0.0.1:51400/relay_off
+curl -X POST http://127.0.0.1:51401/relay_on
+curl -X POST http://127.0.0.1:51401/relay_off
 ```
 
 已连接但上下游网段冲突时，调整热点/USB 网段并继续共享：
 
 ```sh
-curl -X POST http://127.0.0.1:51400/relay_fix_lan
+curl -X POST http://127.0.0.1:51401/relay_fix_lan
 ```
 
 使用已保存 WiFi 连接，`idx` 是 WebUI 中保存列表的顺序，从 `0` 开始：
 
 ```sh
-curl -X POST -d 'idx=0' http://127.0.0.1:51400/connect_saved
+curl -X POST -d 'idx=0' http://127.0.0.1:51401/connect_saved
 ```
 
 删除已保存 WiFi：
@@ -241,7 +240,7 @@ curl -X POST -d 'idx=0' http://127.0.0.1:51400/connect_saved
 ```sh
 curl -X POST \
   -d 'ssid=MyWiFi' \
-  http://127.0.0.1:51400/forget
+  http://127.0.0.1:51401/forget
 ```
 
 切换已保存 WiFi 的范围内自动连接：
@@ -249,20 +248,20 @@ curl -X POST \
 ```sh
 curl -X POST \
   -d 'ssid=MyWiFi&enabled=1' \
-  http://127.0.0.1:51400/autoconnect_saved
+  http://127.0.0.1:51401/autoconnect_saved
 ```
 
 断开连接：
 
 ```sh
-curl -X POST http://127.0.0.1:51400/disconnect
+curl -X POST http://127.0.0.1:51401/disconnect
 ```
 
 启用或关闭开机自启动：
 
 ```sh
-curl -X POST http://127.0.0.1:51400/autostart_on
-curl -X POST http://127.0.0.1:51400/autostart_off
+curl -X POST http://127.0.0.1:51401/autostart_on
+curl -X POST http://127.0.0.1:51401/autostart_off
 ```
 
 ## 命令行一次性连接
@@ -444,28 +443,28 @@ make distclean
 - 使用原版后台别名时，目标设备需要存在 `/bin/dnsmasq`；客户端需要把目标设备作为 DNS 服务器。否则可继续通过当前 LAN 地址访问原版后台。
 - 使用 `wpa_mini.run` 时，目标设备需要存在 `sed` 和 `unzip`。当前目标设备的 BusyBox `unzip` 可用。
 - 程序通常需要 root 权限或足够的网络控制权限。
-- 设备防火墙需要允许访问 `51400` 端口。
+- 设备防火墙需要允许访问 `51401` 端口。
 
 ## 开机自启动
 
 WebUI 的 `启用自启动` 按钮会执行三步：
 
-- 定位当前启动文件，并复制到 `/mnt/userdata/wpa_mini.run` 或 `/mnt/userdata/wpa_mini`。
+- 仅定位当前 `.run` 启动包，并复制到 `/mnt/userdata/wpa_mini.run`。
 - 写入 `/mnt/userdata/wpa_mini_autostart.sh`。
 - 尝试在 `/etc/rc` 末尾写入带标记的启动钩子。
 
 启动钩子只会包含 `# wpa_mini autostart begin` 到 `# wpa_mini autostart end` 之间的内容，关闭自启动时也只移除这段标记块。若根分区仍不可写，WebUI 会提示系统启动钩子写入失败；此时持久启动脚本可能已经写入，但真正开机自启动不会生效。
 
-如果 WebUI 是从 `.run` 启动的，例如 `/tmp/wpa_mini.run -w`，启用自启动时会复制这个 `.run` 到 `/mnt/userdata/wpa_mini.run`。如果 WebUI 是从普通二进制启动的，则会复制当前二进制到 `/mnt/userdata/wpa_mini` 作为兜底。
+如果 WebUI 不是从 `.run` 启动包运行，启用自启动会失败；普通二进制只作为 `.run` 内部载荷或临时调试文件，不作为持久自启动入口。
+
+如果 `/mnt/userdata` 可用空间不足，WebUI 的自启动状态会显示为“设备不支持”，不会改用普通二进制作为 fallback。
 
 开机后自启动脚本会尝试把 `/tmp` remount 为可执行，然后启动持久化后的文件：
 
 ```sh
 /mnt/userdata/wpa_mini.run -w -i wlan0-vxd
-# 或
-/mnt/userdata/wpa_mini -w -i wlan0-vxd
 ```
 
 ## 安全注意
 
-WebUI 没有登录认证，建议只在可信局域网或调试环境中开放。不要把 `51400` 端口直接暴露到不可信网络。已保存 WiFi 文件中包含明文密码，应避免让不可信用户获得设备 shell 或文件读取权限。
+WebUI 没有登录认证，建议只在可信局域网或调试环境中开放。不要把 `51401` 端口直接暴露到不可信网络。已保存 WiFi 文件中包含明文密码，应避免让不可信用户获得设备 shell 或文件读取权限。

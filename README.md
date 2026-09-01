@@ -5,7 +5,7 @@
 `wpa_mini.run` 会自解压 `wpa_mini` 到 `/tmp/wpa_mini` 并运行，默认打开 WebUI：
 
 ```text
-0.0.0.0:51400
+0.0.0.0:51401
 ```
 
 ## 使用
@@ -60,19 +60,19 @@ adb shell 'chmod +x /mnt/userdata/wpa_mini.run; /mnt/userdata/wpa_mini.run -w -i
 如果需要从电脑本机访问 WebUI：
 
 ```sh
-adb forward tcp:51400 tcp:51400
+adb forward tcp:51401 tcp:51401
 ```
 
 然后打开：
 
 ```text
-http://127.0.0.1:51400/
+http://127.0.0.1:51401/
 ```
 
 如果目标设备已经有局域网 IP，也可以直接访问：
 
 ```text
-http://<设备IP>:51400/
+http://<设备IP>:51401/
 ```
 
 程序运行时还会通过目标设备现有的 `dnsmasq` 提供原厂后台别名：
@@ -86,14 +86,14 @@ http://zxic-admin-webui/
 ## 常用参数
 
 ```sh
-/mnt/userdata/wpa_mini.run -w -i wlan0-vxd -L 51400
+/mnt/userdata/wpa_mini.run -w -i wlan0-vxd -L 51401
 ```
 
 | 参数 | 说明 |
 | --- | --- |
 | `-w` | 启动 WebUI |
 | `-i <iface>` | 指定 WiFi STA 接口，默认常用 `wlan0-vxd` |
-| `-L <port>` | 指定 WebUI 端口，默认 `51400` |
+| `-L <port>` | 指定 WebUI 端口，默认 `51401` |
 | `-r <path>` | 指定 DNS 文件路径 |
 | `-l <path>` | 指定日志路径 |
 
@@ -113,7 +113,7 @@ http://zxic-admin-webui/
 
 ## 自启动
 
-在 WebUI 里点击 `启用自启动` 即可。程序会定位当前启动文件，并把运行包复制到 `/mnt/userdata`，然后写入启动脚本。
+在 WebUI 里点击 `启用自启动` 即可。程序要求当前 WebUI 由 `.run` 启动包运行，并把这个启动包复制到 `/mnt/userdata`，然后写入启动脚本。普通二进制启动时不会安装自启动。
 
 推荐持久文件位置：
 
