@@ -2892,6 +2892,8 @@ static int disable_autostart(int *hook_remove_failed)
 	remount_userdata_rw();
 	if (unlink(DEFAULT_AUTOSTART_SCRIPT) < 0 && errno != ENOENT)
 		rc = -1;
+	if (unlink(DEFAULT_RUN_PATH) < 0 && errno != ENOENT)
+		rc = -1;
 	if (unlink("/mnt/userdata/wpa_mini") < 0 && errno != ENOENT)
 		rc = -1;
 	if (remove_autostart_hook() < 0) {
